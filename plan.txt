@@ -1,0 +1,339 @@
+PhoneCacheBlend — Production Journal
+=====================================
+Started: 2026-06-16
+Device:  iPhone 16, 128GB storage, 8GB RAM
+Runtime: llama.cpp + Metal (Swift app, based on llama.swiftui)
+Model:   Qwen2.5-1.5B-Instruct, Q4_K_M (4-bit)
+
+Goal
+----
+Deploy on-device RAG with KV chunk reuse to improve efficiency (TTFT,
+power, heat) compared to full prefill on every query.
+
+First milestone (v0.1): simple reuse by chunk ID
+  - Prefill each document chunk once, save KV state to disk keyed by chunk_id
+  - On a new query, retrieve chunk IDs, load cached KV, stitch, prefill only
+    the question suffix, then decode
+  - No CacheBlend fusion yet (no V-diff / selective recompute)
+
+Deferred to later milestones
+  - CacheBlend-style cross-chunk attention correction (check layer, recomp_ratio)
+  - Full LMCache-style cross-session production cache
+  - Qwen 3B upgrade if 1.5B quality is insufficient
+
+
+Background (design context)
+---------------------------
+Traditional RAG concatenates retrieved passages and runs one full prefill:
+
+  [system_prefix + chunk_A + chunk_B + ... + question] → decode
+
+Cost scales with total prompt length. Every query pays full prefill even
+when passages were seen before.
+
+CacheBlend (reference repo: ~/Desktop/CacheBlend) proposes:
+  1. Collect — prefill each chunk in isolation, save per-layer K/V
+  2. Stitch  — concatenate cached K/V tensors
+  3. Fuse    — selectively recompute ~16% of tokens + full question suffix
+               to fix cross-chunk attention errors
+
+Key insight: chunks prefilled alone never "saw" earlier chunks (causal
+attention). Stitching is an approximation; fusion corrects the worst errors.
+For mobile v0.1 we skip fusion and accept approximate stitch + question
+prefill, with optional boundary recompute added later if quality drops.
+
+What "previous prefill" means
+  - NOT automatic reuse from the last full user prompt
+  - NOT built-in llama.cpp prefix caching alone
+  - IS: reuse KV saved for a specific chunk_id from an earlier prefill
+        (offline index or prior query in the same session)
+
+RAG chunk identity
+  - Two similar questions may retrieve overlapping chunks (e.g. same A, B)
+  - Chunks are keyed by content hash / stable chunk_id, not by question
+  - Same chunk_id across requests → same cached KV blob on disk
+
+
+Hardware constraints (iPhone 16)
+--------------------------------
+  RAM:     8GB total; aim for ~3–4GB peak inference footprint
+  Storage: 128GB; use for model weights + chunk KV library (disk is cheap)
+  GPU:     A18, Metal backend in llama.cpp
+  Risk:    jetsam if RAM too high; thermal throttle on long prefills
+
+Memory budget (Qwen2.5-1.5B Q4_K_M, n_ctx=2048, estimate)
+  Model weights (mmap):     ~1.0 GB on disk, partial resident
+  KV cache (2048 ctx):    ~150–250 MB (less with --cache-type-k/v q4_0)
+  Activations:            ~100–150 MB
+  App + stitch workspace: ~100–200 MB
+  Peak target:            ~2.0–2.5 GB
+
+
+Model & llama.cpp settings (v0.1)
+---------------------------------
+  Model:     Qwen2.5-1.5B-Instruct
+  Quant:     Q4_K_M (GGUF)
+  Source:    Hugging Face → convert or download pre-quantized GGUF
+  Context:   n_ctx = 2048 (start conservative)
+  Backend:   Metal, n_gpu_layers = 99 (all layers)
+  Loading:   mmap enabled (required on iOS)
+  KV quant:  optional q4_0 for K/V cache once baseline works
+
+Suggested llama.cpp flags (CLI / C API equivalent)
+  --mmap
+  -m qwen2.5-1.5b-instruct-q4_k_m.gguf
+  -c 2048
+  -ngl 99
+
+
+Architecture (v0.1 — chunk ID reuse)
+------------------------------------
+
+  Corpus (offline)
+    documents → split into chunks → assign chunk_id = hash(model_id + chunk_text)
+    for each chunk_id:
+      prefill chunk tokens (positions 0..n-1)
+      save llama_state_seq_save_file("cache/{chunk_id}.bin")
+
+  Query (online)
+    question → retriever → [chunk_id_A, chunk_id_B, ...]
+    stitch:
+      pos = 0
+      for each chunk_id in order:
+        load cache/{chunk_id}.bin into scratch sequence
+        copy KV to main sequence at [pos, pos + n_tokens) via seq_cp
+        pos += n_tokens
+    prefill question suffix at n_past = pos
+    decode answer
+
+  Cache miss
+    prefill chunk → save to cache/{chunk_id}.bin → continue stitch
+
+  chunk_id schema (v0.1)
+    chunk_id = SHA256(model_version + tokenizer_version + chunk_text)
+    metadata sidecar: cache/{chunk_id}.json
+      { "chunk_id", "tokens", "n_tokens", "model", "created_at" }
+
+
+Prompt layout
+-------------
+  [system_prefix] + [chunk_A] + [chunk_B] + ... + [question_suffix]
+
+  system_prefix: fixed chat template / RAG instructions (prefilled once or
+                 treated as its own chunk_id "system_v1")
+  question_suffix: always full prefill (never cached in v0.1)
+
+
+What we are NOT doing in v0.1
+-----------------------------
+  [ ] CacheBlend fusion (V-diff, check layer, recomp_ratio)
+  [ ] Automatic cross-request prefix caching only (insufficient for RAG)
+  [ ] Qwen 3B (revisit after 1.5B baseline measured)
+  [ ] Full Musique benchmark port
+
+
+Success criteria (v0.1)
+-----------------------
+  [ ] App runs on iPhone 16 without jetsam under 2048 context
+  [ ] Chunk KV save/load round-trip: load chunk → decode matches fresh prefill
+  [ ] Two queries sharing chunk IDs: 2nd query TTFT < full-prefill baseline
+  [ ] Answer quality on 10 hand-written Q&A pairs: acceptable vs full prefill
+
+
+Measurement checklist
+---------------------
+  Baseline (no reuse):
+    - full prefill [prefix + chunks + question]
+    - record TTFT, tok/s, peak RAM
+
+  With chunk ID reuse:
+    - cold query (all cache miss): record TTFT (expect worse or equal)
+    - warm query (all cache hit):  record TTFT (expect improvement)
+    - mixed query (partial overlap): record TTFT
+
+  Tools: Instruments (Allocations), os_log timestamps around prefill/decode
+
+
+Implementation phases
+---------------------
+
+Phase A — Baseline app
+  [x] Fork llama.cpp/examples/llama.swiftui into PhoneCacheBlend/app
+  [x] Build llama.xcframework (./build-xcframework.sh in llama.cpp)
+  [x] RAG UI: passages + question, full prefill (ContentView, LlamaState)
+  [x] TTFT + prefill ms metrics (LibLlama InferenceMetrics)
+  [x] Qwen2.5-1.5B Q4_K_M as default download model
+  [x] Run on iPhone 16 and record baseline metrics (see journal)
+
+Phase A baseline (iPhone 16, 2026-06-16)
+  Model:    Qwen2.5-1.5B-Instruct Q4_K_M
+  Mode:     full_prefill_rag (2 passages)
+  Prompt:   119 tokens
+  Prefill:  764.2 ms
+  TTFT:     767.6 ms
+  Decode:   128 tokens in 3510.2 ms (~36.5 tok/s)
+  Quality:  correct answer (Exeter College, Oxford) — answer truncated at max_gen_tokens
+
+
+Phase B — Chunk KV store & reuse (DRAFT)
+--------------------------------------
+
+Goal (confirming intent)
+  YES — Phase B is about saving KV for document chunks and reusing them on
+  later queries when the same chunk_id appears again.
+
+  Phase A: every query pays full prefill on [prefix + all passages + question].
+  Phase B: pay full prefill per chunk ONCE, then on later queries load cached
+  KV from disk instead of re-prefilling those passages.
+
+  We are NOT doing CacheBlend fusion yet. Reuse = load saved state + stitch +
+  prefill question only (Phase C wires the full query path; Phase B proves
+  save/load and cache hit/miss).
+
+What is a "chunk"?
+  - One passage block from the RAG UI (text between --- separators), OR
+  - A fixed system-prefix chunk (optional separate chunk_id "system_v1")
+  - NOT the question — question is always fresh prefill in v0.1
+
+What is chunk_id?
+  chunk_id = SHA256(model_filename + chunk_text)
+  Same text + same model → same id → same cache file on disk.
+  Two different questions that retrieve the same passage → same chunk_id → reuse.
+
+Disk layout (on device)
+  Documents/chunks/
+    {chunk_id}.bin          llama_state_seq_save_file (KV + state)
+    {chunk_id}.json         metadata: tokens[], n_tokens, model, created_at
+
+When KV gets saved (collect)
+  Trigger: first time a passage is used in any query (cache miss).
+  Steps:
+    1. Tokenize chunk text (with same wrapper as query path)
+    2. llama_decode() on chunk alone (seq 0, positions 0..n-1)
+    3. llama_state_seq_save_file → Documents/chunks/{chunk_id}.bin
+    4. Write sidecar .json
+
+When KV gets reused (cache hit)
+  Trigger: a later query includes a passage whose chunk_id already has .bin on disk.
+  Steps:
+    1. Skip prefill for that passage
+    2. llama_state_seq_load_file into scratch sequence
+    3. (Phase C) stitch into main sequence at correct position
+    4. Prefill only question suffix
+    5. Decode answer
+
+Cold vs warm query (important for metrics)
+  Cold (all cache miss):
+    - Every chunk prefilled + saved
+    - SLOWER than Phase A baseline (extra save I/O + per-chunk prefills)
+    - Expected; amortize over future queries
+
+  Warm (all cache hit):
+    - Load .bin files from disk, stitch, prefill question only
+    - TTFT should be LOWER than Phase A (~768 ms prefill on 119 tokens)
+    - This is the win we are building toward
+
+  Mixed (partial overlap):
+    - Reuse hits, prefill+save only missing chunks
+    - Common in real RAG (similar questions, overlapping passages)
+
+Phase B scope (what we build)
+  B1 — ChunkStore.swift
+    [ ] chunk_id = SHA256(model + text)
+    [ ] Paths under Documents/chunks/
+    [ ] List / exists / delete cache entries
+
+  B2 — ChunkKV in LibLlama.swift (or ChunkKV.swift)
+    [ ] prefillAndSaveChunk(text) → chunk_id
+    [ ] loadChunk(chunk_id) → restores KV to scratch seq_id=1
+    [ ] Uses llama_state_seq_save_file / llama_state_seq_load_file
+    [ ] Uses llama_memory_clear before each collect/load experiment
+
+  B3 — Prove round-trip on device
+    [ ] Save one passage → load → verify n_tokens / pos matches metadata
+    [ ] Log: cache_hit, cache_miss, save_ms, load_ms
+
+  B4 — UI hook (minimal)
+    [ ] After Ask: auto-save each passage chunk if cache miss
+    [ ] Log per chunk: "cached" or "reused" (reuse wiring completes in Phase C)
+
+Out of scope for Phase B
+  [ ] Stitch multiple chunks into one prompt (Phase C)
+  [ ] End-to-end warm TTFT comparison (Phase C + D)
+  [ ] CacheBlend fusion / RoPE fix (later)
+  [ ] Musique benchmark dataset
+
+Files to add/modify (Phase B)
+  NEW  app/llama.swiftui/Models/ChunkStore.swift
+  NEW  app/llama.cpp.swift/ChunkKV.swift  (or extend LibLlama.swift)
+  EDIT app/llama.cpp.swift/LibLlama.swift   — seq save/load wrappers, n_seq_max≥2
+  EDIT app/llama.swiftui/Models/LlamaState.swift — call collect on passages
+  EDIT app/llama.swiftui.xcodeproj          — add new Swift files
+
+Success criteria (Phase B)
+  [ ] Single chunk save → load round-trip works on iPhone without crash
+  [ ] Second save of same passage skips recompute (cache hit log)
+  [ ] .bin + .json appear in app Documents/chunks/
+  [ ] Metadata n_tokens matches tokenized passage length
+
+Risks to watch (Phase B)
+  - llama_state_seq_* must match same model + tokenizer as collect
+  - Chunk prefilled alone has wrong cross-chunk attention (acceptable until fusion)
+  - RoPE position when stitching deferred to Phase C
+  - Disk: ~0.5–2 MB per short passage chunk (estimate); 128GB storage is fine
+
+Phase B → Phase C handoff
+  Phase B proves: "I can save and load one chunk's KV by chunk_id."
+  Phase C proves: "I can stitch [A,B,C] from cache and answer faster than Phase A."
+
+
+Phase C — Stitch by chunk ID list
+  [ ] Implement stitch(chunk_ids[]) → main sequence
+  [ ] Prefill question only at n_past = stitched_len
+  [ ] End-to-end: retrieve IDs → stitch → answer
+
+Phase D — Validate & iterate
+  [ ] Compare quality vs full prefill (10 questions)
+  [ ] Compare TTFT warm vs cold
+  [ ] If quality drops: add boundary recompute (last N tokens per chunk)
+  [ ] If stable: try n_ctx 4096 or Q4 KV cache
+
+
+Open risks
+----------
+  - RoPE / position mismatch when stitching chunks prefilled at local pos 0..n-1
+    into global positions; may need absolute-position prefill or boundary
+    recompute before fusion
+  - seq_cp position metadata vs actual K tensor rotation (llama.cpp seq_add
+    shifts metadata only, does not re-rotate K)
+  - Chat template must be identical between collect and query paths
+  - First query per new chunk is always slower (collect cost)
+
+
+Journal log
+-----------
+2026-06-16  Project started.
+            Decisions locked:
+              - Folder: ~/Desktop/PhoneCacheBlend
+              - Model: Qwen2.5-1.5B-Instruct Q4_K_M
+              - Target: iPhone 16 (8GB RAM, Metal)
+              - v0.1 goal: simple KV reuse keyed by chunk_id (stitch + Q prefill)
+              - CacheBlend fusion deferred
+
+            Next action: Phase A — scaffold Swift + llama.cpp app, load model,
+            run full-prefill RAG baseline on device.
+
+2026-06-16  Forked llama.swiftui into PhoneCacheBlend/app/.
+            Symlink: PhoneCacheBlend/llama.cpp -> ../llama.cpp (no full repo copy).
+            Updated Xcode project paths to ../llama.cpp/build-apple/llama.xcframework.
+            Added README.md, docs/MODIFY.md (file change guide), cache/ directory.
+            Next action: run ./build-xcframework.sh in llama.cpp, open Xcode project,
+            wire Qwen2.5-1.5B Q4_K_M, implement Phase A RAG UI in ContentView + LlamaState.
+
+2026-06-16  Phase A code: LibLlama (InferenceMetrics, prefill/TTFT timing, mmap, Metal),
+            LlamaState (completeRag, Qwen default), ContentView (passages + question UI).
+
+2026-06-16  Phase A SUCCESS on iPhone 16 (浩浩的iPhone).
+            full_prefill_rag: 119 prompt tokens, prefill 764ms, TTFT 768ms, 36.5 tok/s.
+            Signing fix: bundle id → com.jinghaojiang.phonecacheblend.
+            Next: Phase B — save passage KV by chunk_id, prove load/reuse on disk.

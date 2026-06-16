@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Xcode
+**/xcuserdata/
+**/*.xcuserstate
+DerivedData/
+build/
+
+# Runtime / local data
+cache/*
+!cache/.gitkeep
+
+# Models (download on device; too large for git)
+*.gguf
+*.bin
+
+# Logs
+*.log
