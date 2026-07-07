@@ -2,23 +2,34 @@
 
 On-device RAG with KV chunk reuse for iPhone (llama.cpp + Metal).
 
+Fork of [llama.swiftui](https://github.com/ggml-org/llama.cpp/tree/master/examples/llama.swiftui) plus a patched [llama.cpp](https://github.com/Jinghao26/llama.cpp) (CacheBlend GRAPH fuse, HKVD, seq KV APIs).
+
 ## Layout
 
 ```
 PhoneCacheBlend/
   plan.txt              Production journal
-  llama.cpp -> ../llama.cpp   Symlink to upstream llama.cpp (do not duplicate)
+  llama.cpp -> ../llama.cpp   Symlink to patched llama.cpp (sibling clone)
   app/                  iOS app (forked from llama.swiftui)
   cache/                Chunk KV blobs at runtime (device: Documents/chunks/)
   docs/MODIFY.md        What files to change per phase
 ```
 
-## Build (first time)
-
-1. Build the XCFramework from llama.cpp:
+## Clone
 
 ```bash
-cd ~/Desktop/llama.cpp
+git clone https://github.com/Jinghao26/PhoneCacheBlend.git
+git clone https://github.com/Jinghao26/llama.cpp.git
+# Place both in the same parent directory, then:
+cd PhoneCacheBlend && ln -sf ../llama.cpp llama.cpp
+```
+
+## Build (first time)
+
+1. Build the XCFramework from the patched llama.cpp:
+
+```bash
+cd ../llama.cpp
 ./build-xcframework.sh
 ```
 

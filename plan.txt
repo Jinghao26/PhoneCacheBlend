@@ -10,14 +10,16 @@ Goal
 Deploy on-device RAG with KV chunk reuse to improve efficiency (TTFT,
 power, heat) compared to full prefill on every query.
 
-First milestone (v0.1): simple reuse by chunk ID
+First milestone (v0.1): simple reuse by chunk ID + GRAPH fuse
   - Prefill each document chunk once, save KV state to disk keyed by chunk_id
   - On a new query, retrieve chunk IDs, load cached KV, stitch, prefill only
-    the question suffix, then decode
-  - No CacheBlend fusion yet (no V-diff / selective recompute)
+    the question suffix, fuse (GRAPH), then decode
+  - CacheBlend GRAPH fusion validated on device (Phase E, 2026-06-17)
 
 Deferred to later milestones
-  - CacheBlend-style cross-chunk attention correction (check layer, recomp_ratio)
+  - Q_sub gather in CHECK Step C (use Step A Q without recompute; Metal buffer issue)
+  - Cache system prefix as its own chunk_id (fixed template, reusable per model)
+  - Stitch hot path: skip disk reload for HIT chunks (RAM cache or in-session KV)
   - Full LMCache-style cross-session production cache
   - Qwen 3B upgrade if 1.5B quality is insufficient
 
@@ -52,6 +54,48 @@ RAG chunk identity
   - Two similar questions may retrieve overlapping chunks (e.g. same A, B)
   - Chunks are keyed by content hash / stable chunk_id, not by question
   - Same chunk_id across requests → same cached KV blob on disk
+
+
+KEY NOTE — PCB vs server CacheBlend: not comparable for consistency / TTFT
+-------------------------------------------------------------------------
+Server CacheBlend (~/Desktop/CacheBlend, blend_wikimqa.py / cache_blend_core.py)
+and PhoneCacheBlend measure different things. Do NOT use paper CB TTFT or our
+HPC quality-suite TTFT to verify that PCB implements CB “correctly” or to expect
+matching speedup numbers.
+
+What server CB benchmarks actually time (WikiMQA / Musique / SAMSum paper table):
+  1. Collect (excluded from reported “TTFT cache”):
+     - Chunk-wise GPU prefill per passage; stitch K/V into model.old_kvs in VRAM
+     - Done every query; no persistent disk/RAM blob cache in example scripts
+  2. “TTFT cache” (what the paper reports, e.g. WikiMQA 56 ms):
+     - TTFT of the final llm.generate() only: check=True, fuse with old_kvs
+     - first_token_time − first_scheduled_time on that single call
+  3. “TTFT full” (e.g. 190 ms):
+     - TTFT of one-shot full prefill on the same stitched prompt (check=False)
+  4. “Speedup” (e.g. 3.4×):
+     - TTFT_full / TTFT_cache — fuse decode vs monolithic prefill decode ONLY
+     - Collect cost is NOT in numerator or denominator
+
+What PhoneCacheBlend measures (E2E TTFT):
+  - ensure (disk/RAM cache HIT or GPU collect on MISS)
+  - stitch (deserialize / memcpy / optional label GPU)
+  - fuse (GRAPH cache_blend_fuse)
+  - question post-fuse + first answer token
+  - Plus: disk FIFO (~18 GB WikiMQA corpus) + RAM hot cache (64 slots) — CB
+    example scripts do not have this tier; LMCache hooks in vllm_blend are off
+
+Implication:
+  - Latency / speedup: apples-to-oranges. PCB E2E will look much slower than
+    paper “TTFT cache” even when fuse kernel is correct; warm PCB vs cold CB
+    collect is also unfair.
+  - Quality (F1 / key-phrase): loosely comparable on same passages/questions
+    (fuse vs full prefill answer), not proof of identical timing methodology.
+  - To compare implementations: same metric on each platform separately (see
+    CacheBlend_vs_PhoneCacheBlend_comparison.txt Part 2), or add server-side
+    E2E timing that includes collect + fuse (not in upstream scripts today).
+
+Reference: comparison log Part 1 (paper table) = fuse-step TTFT only; Part 2 =
+per-platform Simple/Harder matrix with explicit “not cross-platform comparable”.
 
 
 Hardware constraints (iPhone 16)
@@ -119,14 +163,15 @@ Prompt layout
 -------------
   [system_prefix] + [chunk_A] + [chunk_B] + ... + [question_suffix]
 
-  system_prefix: fixed chat template / RAG instructions (prefilled once or
-                 treated as its own chunk_id "system_v1")
+  system_prefix: fixed chat template / RAG instructions
+                 (today: GPU prefill every stitch; future: own chunk_id "system_v1")
   question_suffix: always full prefill (never cached in v0.1)
 
 
 What we are NOT doing in v0.1
 -----------------------------
-  [ ] CacheBlend fusion (V-diff, check layer, recomp_ratio)
+  [x] CacheBlend fusion — GRAPH multi-pass fuse (Phase E, 2026-06-17)
+  [ ] System-prefix disk cache (deferred; see future goals)
   [ ] Automatic cross-request prefix caching only (insufficient for RAG)
   [ ] Qwen 3B (revisit after 1.5B baseline measured)
   [ ] Full Musique benchmark port
@@ -134,10 +179,12 @@ What we are NOT doing in v0.1
 
 Success criteria (v0.1)
 -----------------------
-  [ ] App runs on iPhone 16 without jetsam under 2048 context
-  [ ] Chunk KV save/load round-trip: load chunk → decode matches fresh prefill
-  [ ] Two queries sharing chunk IDs: 2nd query TTFT < full-prefill baseline
-  [ ] Answer quality on 10 hand-written Q&A pairs: acceptable vs full prefill
+  [x] App runs on iPhone 16 without jetsam under 2048 context
+  [x] Chunk KV save/load round-trip: load chunk → decode matches fresh prefill (HIT/SAVE logs on device)
+  [x] Two queries sharing chunk IDs: 2nd query E2E TTFT < full-prefill baseline (see Phase C)
+  [x] Answer quality on 10 hand-written Q&A pairs: Scaling test improved after
+      kv_unified fix (Salamanca → Exeter College, Oxford); GRAPH fuse validated
+      on device (2026-06-17); full 10-question matrix still open
 
 
 Measurement checklist
@@ -175,8 +222,8 @@ Phase A baseline (iPhone 16, 2026-06-16)
   Quality:  correct answer (Exeter College, Oxford) — answer truncated at max_gen_tokens
 
 
-Phase B — Chunk KV store & reuse (DRAFT)
---------------------------------------
+Phase B — Chunk KV store (COMPLETE)
+------------------------------------
 
 Goal (confirming intent)
   YES — Phase B is about saving KV for document chunks and reusing them on
@@ -239,23 +286,26 @@ Cold vs warm query (important for metrics)
 
 Phase B scope (what we build)
   B1 — ChunkStore.swift
-    [ ] chunk_id = SHA256(model + text)
-    [ ] Paths under Documents/chunks/
-    [ ] List / exists / delete cache entries
+    [x] chunk_id = SHA256(model + text)
+    [x] Paths under Documents/chunks/
+    [x] FIFO manifest (max 32 entries, oldest evicted)
+    [x] List / exists / clear cache
 
-  B2 — ChunkKV in LibLlama.swift (or ChunkKV.swift)
-    [ ] prefillAndSaveChunk(text) → chunk_id
-    [ ] loadChunk(chunk_id) → restores KV to scratch seq_id=1
-    [ ] Uses llama_state_seq_save_file / llama_state_seq_load_file
-    [ ] Uses llama_memory_clear before each collect/load experiment
+  B2 — LibLlama.swift chunk KV API
+    [x] prefillTokens / tokenizeChunk (no BOS)
+    [x] saveSequenceState / loadSequenceState (llama_state_seq_*)
+    [x] collectAndSaveChunk(prefillText, binPath)
+    [x] n_seq_max = 2, kv_unified = true, batch 2048
 
   B3 — Prove round-trip on device
-    [ ] Save one passage → load → verify n_tokens / pos matches metadata
-    [ ] Log: cache_hit, cache_miss, save_ms, load_ms
+    [x] Save one passage → load → verify n_tokens (manual on iPhone)
+    [x] Log: cache_hit, cache_miss, save_ms, FIFO evicted ids
 
   B4 — UI hook (minimal)
-    [ ] After Ask: auto-save each passage chunk if cache miss
-    [ ] Log per chunk: "cached" or "reused" (reuse wiring completes in Phase C)
+    [x] After Ask: auto-save each passage chunk if cache miss
+    [x] Log per chunk: HIT vs SAVE + FIFO eviction
+    [x] Clear KV button; cache count label
+    [x] Reuse KV in answer path (wired in Phase C)
 
 Out of scope for Phase B
   [ ] Stitch multiple chunks into one prompt (Phase C)
@@ -271,10 +321,21 @@ Files to add/modify (Phase B)
   EDIT app/llama.swiftui.xcodeproj          — add new Swift files
 
 Success criteria (Phase B)
-  [ ] Single chunk save → load round-trip works on iPhone without crash
-  [ ] Second save of same passage skips recompute (cache hit log)
-  [ ] .bin + .json appear in app Documents/chunks/
-  [ ] Metadata n_tokens matches tokenized passage length
+  [x] Single chunk save → load round-trip works on iPhone without crash
+  [x] Second save of same passage skips recompute (cache hit log)
+  [x] .bin + .json appear in app Documents/chunks/
+  [x] Metadata n_tokens matches tokenized passage length
+
+Phase B results (iPhone 16, 2026-06-16)
+  Simple 2-chunk pair demo (Hannibal / Musique-style):
+    Query #1: 2× SAVE (chunk KV written to disk)
+    Query #2: 1× HIT (chunk 1), 1× SAVE (chunk 2 swapped)
+    Cache counter: 2/32 → 3/32
+  Per-chunk SAVE timing (typical): ~200 ms prefill + ~10 ms write per passage
+  Bug fixed: manifest showed 0/32 despite HIT/SAVE — loadManifest() needed
+    dateDecodingStrategy = .iso8601
+  chunk_id = SHA256(model_filename + passage_text)
+  Prefill text format: "[n] passage\n\n" (formatPassageChunk)
 
 Risks to watch (Phase B)
   - llama_state_seq_* must match same model + tokenizer as collect
@@ -287,27 +348,382 @@ Phase B → Phase C handoff
   Phase C proves: "I can stitch [A,B,C] from cache and answer faster than Phase A."
 
 
-Phase C — Stitch by chunk ID list
-  [ ] Implement stitch(chunk_ids[]) → main sequence
-  [ ] Prefill question only at n_past = stitched_len
-  [ ] End-to-end: retrieve IDs → stitch → answer
+Phase C — Stitch by chunk ID list (COMPLETE)
+  [x] Implement stitch(chunk_ids[]) → main sequence (completion_init_with_cached_chunks)
+  [x] Prefill question only at n_past = stitched_len
+  [x] End-to-end: retrieve IDs → stitch → answer (Ask / Ask x2 reuse path)
+  [x] Built-in test cases: Simple (2 chunks), Scaling (6 chunks) — RagTestCases.swift
+  [x] Timing breakdown: cache ensure / stitch prefill / E2E TTFT
 
-Phase D — Validate & iterate
+Phase C results (iPhone 16, 2026-06-16)
+  Model:   Qwen2.5-1.5B-Instruct Q4_K_M
+  Test:    Scaling (6 chunks), pair mode — prompt #2 swaps chunk 3 only (A,B,X,D,E,F)
+  Question: "Where was the author of Hannibal and Scipio educated?"
+
+  Query #1 (cold — 6× SAVE):
+    Passage tokens (per chunk): 87, 73, 64, 84, 75, 90
+    Cache ensure:   1435.3 ms (0 HIT, 6 SAVE)
+    Stitch prefill:  194.5 ms (reload 6 chunks from disk + tail prefill)
+    Stitch TTFT:     208.0 ms (stitch phase only — misleading for reuse wins)
+    E2E TTFT:       1660.0 ms (ensure + stitch + 1st token)
+    Prompt tokens:   512
+    Decode:          19 tokens, ~29 tok/s
+
+  Query #2 (warm/mixed — 5× HIT, 1× SAVE):
+    Cache ensure:    249.1 ms (5 HIT, 1 SAVE)
+    Stitch prefill:  188.9 ms (reload 6 chunks from disk + tail prefill)
+    Stitch TTFT:     204.5 ms
+    E2E TTFT:        464.9 ms (ensure + stitch + 1st token)
+    HIT savings:    ~1104 ms GPU prefill skipped in ensure phase
+    Prompt tokens:   524
+    Decode:          19 tokens, ~30 tok/s
+
+  Speedup (E2E TTFT): 1660 → 465 ms ≈ 3.6× on 2nd query with 5/6 chunk overlap
+
+  Metrics interpretation (important):
+    - HIT skips GPU prefill in cache-ensure phase only (~200 ms/chunk saved)
+    - Stitch phase reloads ALL .bin files every query regardless of HIT/SAVE
+    - Old "TTFT" in Metrics block = stitch phase only → stays ~190–210 ms
+    - Use E2E TTFT for reuse comparisons until stitch skips disk reload on HIT
+
+  Quality (known limitation):
+    Both queries answered "University of Salamanca" (wrong; correct: Exeter
+    College, Oxford in chunk 1). Naive stitch does not recompute cross-chunk
+    attention — acceptable for v0.1 timing proof, not for production quality.
+
+  vs Phase A baseline (119 tokens, full prefill):
+    Phase A TTFT was 768 ms for 119 tokens.
+    Phase C cold E2E (1660 ms) is slower than Phase A on fewer tokens — expected
+    (per-chunk collect + disk I/O amortized over warm queries).
+    Phase C warm E2E (465 ms) beats Phase A TTFT despite ~4× more prompt tokens.
+
+Phase D — HKVD probe + validate (COMPLETE)
+  [x] C++ APIs in llama.cpp fork (rebuild xcframework required):
+        llama_state_seq_get_layer_v_f32 (live KV read, n_pos, multi-stream lookup)
+        llama_compute_hkvd_indices (V-diff top-K + suffix)
+        llama_state_seq_get_layer_kv_data / llama_decode_and_get_layer_kv_data (export helpers)
+  [x] Swift: exportLayerVFloat, buildStitchTokenList, probeHkvdIndices, HkvdProbeResult
+  [x] HKVD check layer = 1 (second transformer block)
+  [x] kv_unified = true in LibLlama (critical stitch fix — see journal 2026-06-17)
+  [x] HKVD probe validated on device (512 tokens, 106 indices, no shape mismatch)
+  [x] Wire HKVD indices → selective recompute (Phase E fuse; see below)
   [ ] Compare quality vs full prefill (10 questions)
-  [ ] Compare TTFT warm vs cold
-  [ ] If quality drops: add boundary recompute (last N tokens per chunk)
+  [ ] Compare TTFT warm vs cold (with enableHkvdProbe off for fair timing)
+  [ ] If quality drops: boundary recompute (last N tokens per chunk) as lighter alternative
   [ ] If stable: try n_ctx 4096 or Q4 KV cache
+
+Phase D results (iPhone 16, 2026-06-17)
+  Test: Scaling (6 chunks), kv_unified + new xcframework + HKVD probe enabled
+  Question: "Where was the author of Hannibal and Scipio educated?"
+
+  Query #1 (cold — 6× SAVE):
+    HKVD: 512 tokens, suffix 18, top-K prefix 88 @ ratio 0.18, 106 indices
+    Export old V 2.3 ms | Full prefill (v_new ref) 1015 ms | Compute 0.6 ms
+    Answer: Exeter College, Oxford (was Salamanca before kv_unified fix)
+    E2E TTFT: 3223 ms
+
+  Query #2 (warm — 5× HIT, 1× SAVE):
+    HKVD: 524 tokens, 109 indices
+    E2E TTFT: 1708 ms (~3.6× vs Q1, same as Phase C warm)
+
+  HKVD semantics (clarified):
+    v_old = layer-1 V from STITCHED KV (prefix GPU + loaded chunks + question GPU)
+    v_new = layer-1 V from ONE contiguous full prefill of same token sequence
+    They are NOT expected to match on cold Q1 — stitch ≠ full prefill even with
+    empty cache. Indices mark positions where stitched V drifts from reference.
+    Probe clears KV and re-stitches before decode; indices are diagnostics only.
+
+  Config: enableHkvdProbe = true adds ~1 s/query (full prefill for v_new).
+          Set false for production timing runs.
+
+
+Phase E — CacheBlend fuse (status 0 / 1 / 2 → llama.cpp) [IMPLEMENTED — see results below]
+--------------------------------------------------------
+Goal: after Phase C stitch + HKVD imp_indices, run fused prefill then decode.
+Maps CacheBlend temp_status to llama.cpp graph + KV cache behavior.
+
+Enum (proposed, llama.h):
+  LLAMA_FUSE_STATUS_NONE   = -1   // normal decode (1 token)
+  LLAMA_FUSE_STATUS_FULL   =  0   // CacheBlend status 0
+  LLAMA_FUSE_STATUS_CHECK  =  1   // CacheBlend status 1
+  LLAMA_FUSE_STATUS_SUBSET =  2   // CacheBlend status 2
+
+Config struct (proposed):
+  llama_cache_blend_params {
+    check_layer;      // e.g. 1 (0-based block index)
+    recomp_ratio;     // e.g. 0.18
+    suffix_len;       // question token count (always in imp)
+    n_imp;            // filled after check, or supplied if precomputed
+    imp_indices[];    // sorted token positions [0, n_prompt)
+    mask_mode;        // POSITION_CAUSAL (default) or BOTTOM_RIGHT
+  }
+
+Prerequisites (already have):
+  - Stitched KV in llama_kv_cache seq 0, positions [0, n_prompt)
+  - kv_unified = true, n_seq_max >= 2 for stitch collect path
+  - llama_compute_hkvd_indices for CHECK layer (or pass precomputed imp)
+
+Per-layer assignment (check_layer = k):
+  layers [0 .. k-1]     → FULL
+  layer  k              → CHECK
+  layers [k+1 .. L-1]   → SUBSET
+  after fuse prefill    → NONE (normal decode)
+
+--- STATUS 0: LLAMA_FUSE_STATUS_FULL (CacheBlend status 0) ---
+  When: layers before check_layer; also optional “warmup” if check_layer=0 skipped.
+  Hidden stream:
+    ubatch.n_tokens = n_prompt (N)
+    ubatch.pos[i] = i; token[i] from stitch token list
+    All N rows through input LN → QKV → attn → MLP → next layer
+  KV cache:
+    Normal llama_kv_cache cpy_k / cpy_v for all tokens in batch (write fresh K/V)
+    Do NOT read stitched old_kv for forward hidden path (fresh block compute)
+  Attention mask:
+    Standard causal: set_input_kq_mask, n_kv == n_tokens == N
+  HKVD: none
+  Output to next layer: h_out shape N × n_embd
+
+--- STATUS 1: LLAMA_FUSE_STATUS_CHECK (CacheBlend status 1) ---
+  When: layer index == check_layer (default k=1).
+  Hidden stream IN: N rows (from FULL layer below).
+  Step A — full-width QKV (all N):
+    Q, K, V = proj(h[0..N-1]); apply RoPE at ubatch.pos[i]
+  Step B — HKVD (once, at this layer):
+    v_old = read V from stitched KV at positions [0,N)  (live cache / export)
+    v_new = V just computed in Step A
+    imp_indices = llama_compute_hkvd_indices(v_old, v_new, ..., suffix_len, ratio)
+    OR use precomputed imp_indices from Swift probe (skip v_new full prefill)
+  Step C — subset attention:
+    ubatch.n_tokens = n_imp = |imp_indices|
+    ubatch.pos[j] = imp_indices[j];  // original absolute positions
+    Q_sub = Q[imp_indices]
+    K_attn, V_attn = full cache get_k/get_v (length n_kv = N)
+    Patch: cpy_k/cpy_v fresh K/V into cache cells at imp_indices only
+    Optional: re-RoPE stitched K at non-imp slots if stitch rotation wrong
+  Attention mask:
+    n_tokens = n_imp, n_kv = N (same as decode: subset Q vs full KV)
+    POSITION_CAUSAL: query at pos p sees keys with cell pos <= p
+    (or BOTTOM_RIGHT to match vLLM CacheBlend exactly)
+  Hidden stream OUT: n_imp rows only
+    h_out = h[imp_indices] after attn+MLP on subset stream
+    Store imp_indices + n_imp in fuse params for upper layers
+
+--- STATUS 2: LLAMA_FUSE_STATUS_SUBSET (CacheBlend status 2) ---
+  When: layers > check_layer.
+  Hidden stream:
+    ubatch.n_tokens = n_imp
+    ubatch.pos[j] = imp_indices[j]
+    QKV proj only on n_imp rows
+  KV cache:
+    Read full K/V tensors (n_kv = N) for attention
+    After computing fresh K/V for imp rows: patch only imp_indices slots
+    Non-imp positions: leave stitched K/V unchanged
+  Attention mask: same as CHECK (n_imp queries vs N keys)
+  Hidden stream OUT: n_imp rows
+  Repeat for each layer until final norm → logits from last suffix token
+
+--- STATUS -1: LLAMA_FUSE_STATUS_NONE (decode) ---
+  Normal llama_decode: 1 token, n_kv grows; no fusion.
+
+Key llama.cpp touchpoints:
+  llama-context.cpp     — fuse prefill driver (layer loop, pick status per il)
+  llama-graph.cpp       — build_attn with n_tokens != n_kv; fuse mask fill
+  llama-kv-cache.cpp    — patch k/v at cell indices; set_input_kq_mask fuse variant
+  llama.h               — llama_cache_blend_params, llama_decode_fused(...)
+  LibLlama.swift        — after stitch: llama_cache_blend_fuse(...); then decode
+
+Entry flow (PhoneCacheBlend):
+  1. ensurePassagesCached + completion_init_with_cached_chunks (stitch, KV full N)
+  2. optional probe → imp_indices (or compute inside CHECK at layer k)
+  3. llama_cache_blend_fuse(ctx, params)  // replaces extra full prefill + naive decode KV
+  4. completion_loop (decode)
+
+Invariants:
+  - KV buffer length always n_prompt (N); never shrink to n_imp
+  - imp_indices includes all suffix positions [N-suffix_len .. N-1]
+  - Hidden activations after check: n_imp rows only
+  - check_layer k requires layers 0..k-1 as FULL (all N)
+
+Tests to add:
+  [x] test-cache-blend-fuse.cpp: stitch → fuse smoke (V improved at imp; greedy decode)
+  [x] test-cache-blend-kv-patch.cpp: CPU KV patch isolation vs full prefill (see Mac tests)
+  [ ] test-cache-blend-fuse: strict logits equality vs full prefill (optional tighten)
+  [ ] extend test-hkvd-integration with fuse status mock at one layer
+
+
+Phase E — CacheBlend fuse (COMPLETE)
+------------------------------------
+Goal: after Phase C stitch, run CacheBlend-style fuse then decode (no extra full prefill).
+
+API (llama.h):
+  llama_cache_blend_fuse(ctx, &params)
+  llama_cache_blend_params {
+    mode;           // TOKEN_RECOMPUTE | GRAPH
+    check_layer;    // default 1
+    recomp_ratio;   // default 0.18
+    suffix_len;     // question token count
+    tokens[];       // full stitch token list (must match KV positions)
+    imp_indices[];  // optional precomputed; else HKVD inside fuse
+  }
+
+Fuse modes:
+  TOKEN_RECOMPUTE (v1 fallback):
+    seq_rm from min(imp) → one contiguous llama_decode of tokens[min_imp..N)
+    through ALL layers. Simple, causally correct, ~491/512 tokens recomputed.
+    Device fuse ~2144 ms (6-chunk Scaling test, pre-GRAPH).
+
+  GRAPH (default, production):
+    Multi-pass CacheBlend status 0/1/2 at check_layer k=1:
+      FULL:       layers [0 .. k-1] on all N tokens (chunked by n_batch)
+      CHECK (A):  QKV+RoPE on all N at layer k; write KV; export V for HKVD
+      HKVD:       v_old (stitched) vs v_new (Step A); pick ~18% prefix + suffix
+      CHECK (C):  subset attn on |imp| at layer k (n_imp queries vs N KV)
+      SUBSET:     layers [k+1 .. L-1] on |imp| scattered tokens only
+    Target: only ~106 tokens in upper layers vs ~491 in TOKEN_RECOMPUTE.
+
+C++ implementation (llama.cpp fork):
+  [x] llama-cache-blend.cpp — multipass driver, TOKEN_RECOMPUTE, GRAPH
+  [x] llama-context.cpp — decode_cache_blend, KV patch mode, hidden/QKV extract
+  [x] llama-graph.cpp — fuse graph flags, build_attn optional KV store (null k/v)
+  [x] llama-kv-cache.cpp — find_slot_patch, fuse_patch skips prefix purge
+  [x] models/qwen2.cpp — CHECK Step A (qkv_only), Step C (check_subset)
+  [x] Chunked FULL/embd passes respect n_batch (device n_batch=512)
+  [x] Step A QKV stored across chunks (cache_blend_store_fuse_qkv with offset)
+  [x] test-cache-blend-kv-patch.cpp — CPU KV patch isolation (GRAPH, 2026-06-22)
+  [ ] Q_sub gather via build_inp_fuse_qkv (Metal "tensor buffer not set" — deferred)
+
+Swift (PhoneCacheBlend):
+  [x] LibLlama.swift — CacheBlendFuseMode, cacheBlendFuse(), setStitchTokenList
+  [x] LlamaState.swift — stitch → fuse → decode; phase_e_fuse metrics
+  [x] enableCacheBlendFuse = true; cacheBlendFuseMode = .graph (default)
+  [x] GRAPH failure → auto-retry TOKEN_RECOMPUTE; else re-stitch fallback
+  [x] enableHkvdProbe = false (HKVD runs inside fuse when imp_indices nil)
+  [x] ctx: n_ctx=2048, n_seq_max=2, kv_unified=true, n_batch=n_ubatch=512,
+      flash_attn_type=DISABLED
+
+Mac tests (Qwen 0.5B, /tmp/qwen0.5b-test.gguf, layer 1):
+  [x] test-cache-blend-fuse TOKEN_RECOMPUTE — PASS
+  [x] test-cache-blend-fuse GRAPH — PASS (Metal)
+  [x] GRAPH with LLAMA_TEST_N_BATCH=32 — PASS (chunked FULL + Step A)
+  [x] test-cache-blend-kv-patch GRAPH — PASS (CPU, 2026-06-22)
+
+test-cache-blend-kv-patch.cpp — fuse KV patch verification (CPU)
+  Fixture: real PhoneCacheBlend RAG text (Nabbes / Exeter + Punica + Hannibal Q).
+  Flow: collect 2 chunks → stitch → full-prefill reference → stitch snapshot →
+        GRAPH fuse (check_layer=1, recomp_ratio=0.18) → export V per layer.
+  Asserts (llama_state_seq_get_layer_v_f32):
+    FULL layer 0:     all N positions V_fused ≈ V_full_prefill (tol 0.02)
+    CHECK layer 1:    all N positions V_fused ≈ V_ref (Step A + Step C)
+    SUBSET layer 2:   imp positions V_fused ≈ V_ref; non-imp V_fused == V_stitch_pre
+    SUBSET layer 23:  non-imp unchanged vs pre-fuse stitch (patch isolation)
+    Logits:           greedy next token matches full prefill (576 on 0.5B run)
+  Qwen 0.5B run (151 prompt tokens, |imp|=41 = 23 prefix + 18 suffix):
+    layer 0 FULL: 151/151 match ref
+    layer 2 SUBSET: 41/41 imp match ref; 110/110 non-imp unchanged
+    layer 23 SUBSET: 110/110 non-imp unchanged
+  Run:  cd llama.cpp/build-hkvd-test
+        cmake --build . --target test-cache-blend-kv-patch -j8
+        ./bin/test-cache-blend-kv-patch [model.gguf] [check_layer]
+  Settings: n_gpu_layers=0, flash_attn DISABLED, kv_unified=true (matches app).
+  Confirms GRAPH fuse patches only imp_indices above check_layer; FULL pass
+  rewrites all N below check; non-imp stitched KV left intact on SUBSET layers.
+
+Phase E results (iPhone 16, 2026-06-17)
+  Model:   Qwen2.5-1.5B-Instruct Q4_K_M
+  Test:    Scaling (6 chunks), GRAPH fuse, enableHkvdProbe=false
+  Question: "Where was the author of Hannibal and Scipio educated?"
+
+  Query #1 (cold — 6× SAVE):
+    Cache ensure:   1385.3 ms (0 HIT, 6 SAVE)
+    Stitch prefill:  539.2 ms (reload 6 chunks from disk + tail)
+    Fuse (GRAPH):    348.5 ms
+    |imp| = 106 (88 prefix + 18 suffix @ ratio 0.18)
+    E2E TTFT:       1963.4 ms (ensure + stitch + 1st token)
+    Answer:         Exeter College, Oxford (correct; Q1 decode verbose/repetitive)
+
+  Query #2 (warm — 5× HIT, 1× SAVE):
+    Cache ensure:    256.6 ms (5 HIT, 1 SAVE)
+    Stitch prefill:  550.1 ms (reload 6 chunks from disk + tail)
+    Fuse (GRAPH):    353.6 ms
+    |imp| = 109 (91 prefix + 18 suffix)
+    E2E TTFT:        847.5 ms
+    HIT savings:    ~1104 ms GPU prefill skipped in ensure phase
+    Answer:         Exeter College, Oxford (correct, clean one-paragraph)
+
+  Fuse speedup vs TOKEN_RECOMPUTE (same 6-chunk test, prior runs):
+    Q1: 2144 ms → 349 ms ≈ 6.2× faster fuse
+    Q2: 2246 ms → 354 ms ≈ 6.3× faster fuse
+
+  E2E TTFT speedup vs TOKEN_RECOMPUTE fuse path (prior):
+    Q1: ~4182 ms → 1963 ms ≈ 2.1×
+    Q2: ~2734 ms →  848 ms ≈ 3.2×
+
+  Bottleneck shift:
+    Fuse no longer dominates. Stitch disk reload (~540–550 ms) and cold ensure
+    (~1385 ms) are now the main costs. RAM hot cache is highest-impact next step.
+
+  Known issues / follow-ups:
+    - Q1 decode repetition (factually correct but self-contradictory prose) —
+      likely sampling/max_tokens, not fuse; Q2 clean on same GRAPH path
+    - Stitch still reloads all .bin files every query regardless of HIT/SAVE
+    - Q_sub gather optimization not wired (Step C recomputes QKV on |imp|)
 
 
 Open risks
 ----------
+  - Cross-chunk attention: chunks prefilled in isolation; stitch is approximate
+    until fusion / selective recompute (HKVD indices identify worst positions)
   - RoPE / position mismatch when stitching chunks prefilled at local pos 0..n-1
     into global positions; may need absolute-position prefill or boundary
     recompute before fusion
-  - seq_cp position metadata vs actual K tensor rotation (llama.cpp seq_add
-    shifts metadata only, does not re-rotate K)
+  - seq_cp with kv_unified=false + n_seq_max=2: cross-stream copy WIPES stream 0
+    on each chunk merge — FIXED by kv_unified=true (use unified KV buffer)
   - Chat template must be identical between collect and query paths
   - First query per new chunk is always slower (collect cost)
+  - HKVD probe overhead when enableHkvdProbe=true (~1 s full prefill per query)
+
+
+Future goals (refinements)
+--------------------------
+  [ ] System prefix cache — treat PhoneCacheBlendConfig.systemPrefix as a fixed
+      chunk_id (e.g. SHA256(model + "system_v1")), save/load like passages;
+      stitch order: [cached prefix] → [chunks] → [question]. Small latency win.
+  [x] HKVD fusion — GRAPH multi-pass fuse wired (Phase E, 2026-06-17)
+  [ ] RAM hot cache — keep HIT chunk KV in memory to avoid disk reload each stitch
+      (~540–550 ms stitch prefill today reloads all .bin files regardless of HIT)
+  [ ] Question prefill after fuse (not during stitch) —
+      Today: stitch prefills labels + question (~27 tok), then fuse runs on all N
+      tokens with suffix_len = question length; fuse always recomputes the full
+      question suffix (~18% prefix + all suffix in |imp|). That double-touches the
+      question and adds cost to the GRAPH pass (layer 0 on N, HKVD on N, subset
+      recompute on suffix tokens).
+      Goal: stitch passage-only KV (prefix + [n] labels + cached chunk bodies),
+      fuse with suffix_len = 0 (HKVD / recompute on passage boundaries only),
+      then normal GPU prefill of question suffix on fused KV before decode.
+      Rationale: CacheBlend fixes stitched passage consistency, not the query;
+      question was never cached; causal attention lets post-fuse question prefill
+      see corrected passage KV. Labels stay in stitch (~2–4 tok/chunk, negligible).
+      Expected: modest fuse savings (fewer tokens in |imp|, no suffix in GRAPH);
+      stitch dominated by KV merge unchanged. A/B quality vs current path.
+      Touch: completion_init_with_cached_chunks (optional skip question step),
+      LlamaState runSingleRagQuery (fuse → prefillQuestionTail → decode),
+      cacheBlendFuse(suffix_len: 0), buildStitchTokenList split (passage vs Q),
+      timing metrics (separate “Question prefill” line).
+  [ ] Q_sub gather in CHECK Step C (skip Q recompute on |imp|)
+  [ ] enableHkvdProbe toggle in UI (default off for benchmarks)
+  [ ] 10-question quality matrix: stitch vs full prefill vs stitch+GRAPH fuse
+  [ ] Decode tuning: repetition penalty / lower max_tokens if verbose answers persist
+  [ ] Optional: boundary recompute (last N tokens per chunk) before full fusion
+  [ ] Content-addressed chunk cache (fix [n] index mismatch) —
+      Today chunk_id = SHA256(model + "[n] passage…"), so the same passage at a
+      different list position is a cache MISS (e.g. P3 as [3] vs [1]).
+      TODO: hash raw passage text only; collect/save KV for body
+      ("passage\n\n", no [n]); at stitch prefill "[n] " fresh (~2–4 tok/chunk)
+      then merge cached body KV via seq_cp. Update ChunkStore.chunkId,
+      ensurePassagesCached, completion_init_with_cached_chunks,
+      buildStitchTokenList. Bump cache version / clear Documents/chunks after
+      change (invalidates existing .bin keys). Matches reference CacheBlend
+      (stable doc chunks) and improves reuse across Simple_test queries.
 
 
 Journal log
@@ -337,3 +753,113 @@ Journal log
             full_prefill_rag: 119 prompt tokens, prefill 764ms, TTFT 768ms, 36.5 tok/s.
             Signing fix: bundle id → com.jinghaojiang.phonecacheblend.
             Next: Phase B — save passage KV by chunk_id, prove load/reuse on disk.
+
+2026-06-16  Phase B implemented (collect + FIFO disk cache, not stitch yet).
+            ChunkStore.swift, LibLlama chunk KV APIs, LlamaState ensurePassagesCached.
+            FIFO max 32 chunks; Documents/chunks/{id}.bin + manifest.json.
+            Ask still full-prefills answer; Phase C will reuse cached KV in query path.
+
+2026-06-16  Phase B VALIDATED on iPhone 16.
+            2-chunk pair demo: Q1 2× SAVE, Q2 1× HIT + 1× SAVE, cache 2/32 → 3/32.
+            Manifest 0/32 display bug fixed (ISO8601 date decoding).
+
+2026-06-16  Phase C implemented.
+            completion_init_with_cached_chunks (seq load/cp/add stitch path).
+            Pair mode UI; RagTestCases.swift (Simple 2-chunk, Scaling 6-chunk).
+            Timing breakdown: cache ensure / stitch / E2E TTFT in LlamaState logs.
+
+2026-06-16  Phase C VALIDATED on iPhone 16 — Scaling (6 chunks) pair test.
+            Q1 E2E TTFT 1660 ms (6 SAVE); Q2 E2E TTFT 465 ms (5 HIT, 1 SAVE).
+            ~3.6× E2E speedup on partial overlap. Stitch TTFT flat ~200 ms (disk reload).
+            Answer quality wrong (Salamanca) — stitch approximation, fusion deferred.
+            Next: Phase D — quality vs full prefill; optional RAM hot cache to speed stitch.
+
+2026-06-17  Phase D started — HKVD probe + llama.cpp C++ export APIs.
+            Added to llama.cpp fork (~/Desktop/llama.cpp):
+              - llama_state_seq_get_layer_v_f32: export one layer V as f32
+                [n_tokens][n_kv_heads][head_dim]; live KV read (not state-blob parse);
+                n_pos param for positions [0,n_pos); multi-stream cell lookup;
+                seq_has filter for requested sequence
+              - llama_compute_hkvd_indices: CacheBlend-style V-diff top-K + suffix
+              - llama_state_seq_get_layer_kv_data, llama_decode_and_get_layer_kv_data
+            Tests: test-hkvd-export.cpp, test-hkvd-stitch.cpp (local Mac builds).
+
+2026-06-17  Swift wiring (LibLlama.swift, LlamaState.swift):
+              - exportLayerVFloat, computeHkvdIndices, probeHkvdIndices
+              - buildStitchTokenList (must match stitch tokenization for v_new)
+              - defaultHkvdCheckLayer() → 1
+              - enableHkvdProbe, hkvdRecompRatio = 0.18 in PhoneCacheBlendConfig
+              - Probe after stitch; on success/failure re-stitch before decode
+              - HkvdProbeResult summary in message log
+
+2026-06-17  HKVD probe debugging (device):
+            - hkvdExportFailed(-4): state blob parser broken on multi-stream Metal KV
+              → fixed with live KV read from llama_kv_cache
+            - hkvdShapeMismatch(108, 512): v_old from seq_has count vs 512 stitch tokens
+              → position-based export + n_pos; still failed until kv_unified fix
+            - v_new tokenization mismatch → buildStitchTokenList for fresh prefill
+
+2026-06-17  Critical stitch fix: kv_unified = true (LibLlama ctx_params).
+            Root cause: n_seq_max=2 with kv_unified=false maps seq0→stream0, seq1→stream1.
+            Cross-stream seq_cp WIPES stream 0 on every chunk merge — only last chunk +
+            question KV survived (~108 tokens). Wrong answers (Salamanca) + HKVD mismatch.
+            With kv_unified=true: single stream; seq_cp merges metadata without wiping prefix.
+            Local test-hkvd-stitch: 26/26 positions export OK after fix.
+
+2026-06-17  xcframework rebuild:
+            ./build-xcframework.sh in ~/Desktop/llama.cpp
+            Output: build-apple/llama.xcframework (iOS device + sim + macOS + tvOS + visionOS)
+            First parallel build failed (tvOS disk I/O); single retry succeeded.
+            Xcode path unchanged: PhoneCacheBlend/llama.cpp/build-apple/llama.xcframework
+
+2026-06-17  Phase D VALIDATED on iPhone 16 — Scaling (6 chunks) with HKVD probe.
+            Q1: HKVD 106 indices (88 prefix + 18 suffix), E2E TTFT 3223 ms
+            Q2: 5 HIT 1 SAVE, HKVD 109 indices, E2E TTFT 1708 ms
+            Answer: Exeter College, Oxford (both queries) — improved from Salamanca
+            HKVD semantics documented: v_old=stitched KV, v_new=reference full prefill;
+            non-zero indices on cold Q1 expected (stitch ≠ contiguous prefill).
+            System prefix: GPU prefill each stitch today; cache as chunk deferred.
+
+            Next: wire HKVD indices → selective recompute; system prefix cache;
+            disable probe for benchmark runs; 10-question quality matrix.
+
+2026-06-17  Phase E implemented — llama_cache_blend_fuse API + GRAPH multi-pass.
+            C++ (llama.cpp fork):
+              - llama_cache_blend_fuse(ctx, params): TOKEN_RECOMPUTE + GRAPH modes
+              - GRAPH: FULL [0..k-1] → CHECK Step A (QKV on N) → HKVD →
+                CHECK Step C (subset attn |imp|) → SUBSET [k+1..L-1] on |imp|
+              - decode_cache_blend: KV patch mode, hidden extract, QKV store
+              - Chunked passes for n_batch; Step A QKV append across chunks
+              - test-cache-blend-fuse.cpp: stitch → fuse (both modes PASS on Mac Metal)
+            Swift:
+              - cacheBlendFuse(), CacheBlendFuseMode (.graph / .tokenRecompute)
+              - Flow: stitch → fuse → decode; metrics mode phase_e_fuse
+              - Default .graph; TOKEN_RECOMPUTE fallback on GRAPH failure
+              - n_batch=n_ubatch=512, flash_attn DISABLED
+            Bugs fixed during Phase E:
+              - Double hidden extract; llama_batch_free corrupting external embd
+              - Step A slot failure → patch mode; FULL pass KV patch always on
+              - Sampler crash: llama_sampler_sample(..., -1) not batch.n_tokens-1
+              - Large N batch → chunk FULL/embd by n_batch
+              - iPhone SIGABRT: KV patch on FULL pass + batch chunking
+
+2026-06-17  Phase E VALIDATED on iPhone 16 — Scaling (6 chunks), GRAPH fuse.
+            Q1 (6× SAVE): fuse 349 ms, |imp|=106, E2E TTFT 1963 ms
+            Q2 (5 HIT, 1 SAVE): fuse 354 ms, |imp|=109, E2E TTFT 848 ms
+            Fuse ~6× faster than TOKEN_RECOMPUTE (~2144 ms → ~350 ms)
+            E2E TTFT ~2–3× faster than TOKEN_RECOMPUTE fuse path
+            Answer: Exeter College, Oxford (both queries, correct)
+            Bottleneck: stitch disk reload (~550 ms); cold ensure (~1385 ms)
+            Next: RAM hot cache for HIT chunks; Q_sub gather; 10-Q quality matrix.
+
+2026-06-22  test-cache-blend-kv-patch.cpp added — CPU fuse KV patch verification.
+            Real RAG fixture (Nabbes/Exeter + Punica + Hannibal question).
+            PASS on Qwen2.5-0.5B CPU: FULL layer all-N match ref; SUBSET non-imp
+            unchanged (110/110 at layers 2 and 23); first SUBSET imp ≈ ref;
+            greedy token matches full prefill. Registered in tests/CMakeLists.txt.
+            Confirms GRAPH patch behaviour: imp-only scatter above check_layer.
+
+2026-07-05  Documented chunk_id fragility: [n] prefix in hash blocks reuse when
+            same passage appears at different list indices. Added Future goal:
+            content-addressed cache (hash raw passage, prefill [n] label at stitch).
+            See comparison log + quality matrix TTFT analysis.

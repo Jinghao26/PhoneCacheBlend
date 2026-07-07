@@ -1,0 +1,40 @@
+{
+  "platform": "phonecacheblend_llama_cpp",
+  "model": "qwen2.5-1.5b-instruct-q4_k_m",
+  "suite": "simple",
+  "suite_name": "Simple_test (10 queries)",
+  "pass_threshold": 0.7,
+  "timestamp": "FILL_AFTER_RUN",
+  "summary": {
+    "baseline": {
+      "pass_count": 0,
+      "query_count": 10,
+      "avg_score": 0.0,
+      "avg_ttft_ms": 0.0
+    },
+    "phonecacheblend": {
+      "pass_count": 0,
+      "query_count": 10,
+      "avg_score": 0.0,
+      "avg_ttft_ms": 0.0
+    }
+  },
+  "runs": [
+    {
+      "id": 1,
+      "title": "Butter & cookies",
+      "baseline": {
+        "answer": "",
+        "ttft_ms": 0.0,
+        "score": 0.0,
+        "passed": false
+      },
+      "phonecacheblend": {
+        "answer": "",
+        "ttft_ms": 0.0,
+        "score": 0.0,
+        "passed": false
+      }
+    }
+  ]
+}
