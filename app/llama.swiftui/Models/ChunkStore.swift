@@ -77,6 +77,120 @@ struct ChunkCacheOpResult: Sendable {
     let evictedChunkIds: [String]
 }
 
+/// Per-component ensure wall times (ms) for one PCB query.
+/// Ensure = make prefix/passage/label KV available for stitch (disk HIT or collect+store).
+struct EnsureTimingBreakdown: Sendable {
+    /// SHA-256 chunk_id + `hasValidCache` / label RAM get.
+    var lookupMs: Double = 0
+    /// Read `.json` metadata on disk HIT.
+    var metaReadMs: Double = 0
+    /// Tokenize for token-count fallback or collect path.
+    var tokenizeMs: Double = 0
+    /// GPU `llama_decode` collect (passage/prefix body).
+    var prefillMs: Double = 0
+    /// Write `.bin` KV blob to disk.
+    var storeMs: Double = 0
+    /// Write `.json` metadata.
+    var metaWriteMs: Double = 0
+    /// FIFO manifest register + eviction.
+    var registerMs: Double = 0
+    /// `captureSequenceState` + RAM-hot put after SAVE.
+    var ramWarmMs: Double = 0
+    /// Label RAM lookup (HIT path).
+    var labelLookupMs: Double = 0
+    /// Label GPU collect + RAM put (MISS path).
+    var labelPrefillMs: Double = 0
+    /// FIFO touchExisting on HIT.
+    var touchMs: Double = 0
+
+    var passageHits: Int = 0
+    var passageMisses: Int = 0
+    var labelHits: Int = 0
+    var labelMisses: Int = 0
+    /// nil = prefix cache disabled / skipped.
+    var prefixHit: Bool?
+
+    var accountedMs: Double {
+        lookupMs + metaReadMs + tokenizeMs + prefillMs + storeMs
+            + metaWriteMs + registerMs + ramWarmMs
+            + labelLookupMs + labelPrefillMs + touchMs
+    }
+
+    mutating func merge(_ other: EnsureTimingBreakdown) {
+        lookupMs += other.lookupMs
+        metaReadMs += other.metaReadMs
+        tokenizeMs += other.tokenizeMs
+        prefillMs += other.prefillMs
+        storeMs += other.storeMs
+        metaWriteMs += other.metaWriteMs
+        registerMs += other.registerMs
+        ramWarmMs += other.ramWarmMs
+        labelLookupMs += other.labelLookupMs
+        labelPrefillMs += other.labelPrefillMs
+        touchMs += other.touchMs
+        passageHits += other.passageHits
+        passageMisses += other.passageMisses
+        labelHits += other.labelHits
+        labelMisses += other.labelMisses
+        if let p = other.prefixHit { prefixHit = p }
+    }
+
+    func formattedLog(ensureTotalMs: Double) -> String {
+        var lines: [String] = []
+        lines.append("--- Ensure breakdown ---")
+        if let prefixHit {
+            lines.append("  Prefix:          \(prefixHit ? "HIT" : "SAVE")")
+        }
+        lines.append(String(
+            format: "  Lookup:          %.1f ms  (id hash + disk/RAM validity)",
+            lookupMs
+        ))
+        if metaReadMs > 0 {
+            lines.append(String(format: "  Meta read:       %.1f ms  (.json)", metaReadMs))
+        }
+        if touchMs > 0 {
+            lines.append(String(format: "  Touch:           %.1f ms  (FIFO touch on HIT)", touchMs))
+        }
+        if tokenizeMs > 0 {
+            lines.append(String(format: "  Tokenize:        %.1f ms", tokenizeMs))
+        }
+        lines.append(String(
+            format: "  Prefill (GPU):   %.1f ms  (%d MISS collect)",
+            prefillMs, passageMisses + ((prefixHit == false) ? 1 : 0)
+        ))
+        lines.append(String(format: "  Store (.bin):    %.1f ms", storeMs))
+        if metaWriteMs > 0 {
+            lines.append(String(format: "  Meta write:      %.1f ms  (.json)", metaWriteMs))
+        }
+        if registerMs > 0 {
+            lines.append(String(format: "  Register/FIFO:   %.1f ms", registerMs))
+        }
+        if ramWarmMs > 0 {
+            lines.append(String(format: "  RAM warm:        %.1f ms  (capture + put)", ramWarmMs))
+        }
+        if labelLookupMs > 0 || labelPrefillMs > 0 {
+            lines.append(String(
+                format: "  Label lookup:    %.1f ms  (%d HIT)",
+                labelLookupMs, labelHits
+            ))
+            lines.append(String(
+                format: "  Label prefill:   %.1f ms  (%d MISS)",
+                labelPrefillMs, labelMisses
+            ))
+        }
+        lines.append(String(
+            format: "  Passages:        %d HIT / %d SAVE",
+            passageHits, passageMisses
+        ))
+        lines.append("  ─────────────────────────")
+        lines.append(String(
+            format: "  Sum components:  %.1f ms  (residual %+.1f ms vs ensure %.1f ms)",
+            accountedMs, ensureTotalMs - accountedMs, ensureTotalMs
+        ))
+        return lines.joined(separator: "\n")
+    }
+}
+
 final class ChunkStore {
     private let baseURL: URL
     private let fileManager = FileManager.default

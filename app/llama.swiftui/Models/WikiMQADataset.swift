@@ -12,12 +12,45 @@ struct WikiMQAExample: Codable, Sendable {
     let answers: [[String]]
 }
 
-enum WikiMQADataset {
-    static let bundleFilename = "wikimqa_s"
+enum WikiMQADatasetVariant: String, CaseIterable, Identifiable, Sendable {
+    /// Original CacheBlend `wikimqa_s.json` (200 queries).
+    case original = "WikiMQA (200)"
+    /// Filtered subset from CacheBlend issue #30 (102 queries, gold fixes).
+    case clean = "WikiMQA clean (102)"
 
-    static func load(from bundle: Bundle = .main) throws -> [WikiMQAExample] {
-        guard let url = bundle.url(forResource: bundleFilename, withExtension: "json") else {
-            throw WikiMQADatasetError.missingBundleFile
+    var id: String { rawValue }
+
+    var bundleFilename: String {
+        switch self {
+        case .original: return "wikimqa_s"
+        case .clean: return "wikimqa_s_clean"
+        }
+    }
+
+    var logLabel: String {
+        switch self {
+        case .original: return "WikiMQA"
+        case .clean: return "WikiMQA clean"
+        }
+    }
+
+    var corpusNote: String {
+        switch self {
+        case .original:
+            return "Corpus: 1,055 unique passages, 10 per query"
+        case .clean:
+            return "Filtered 102-query subset (CacheBlend #30); same ctxs for kept rows"
+        }
+    }
+}
+
+enum WikiMQADataset {
+    static func load(
+        variant: WikiMQADatasetVariant = .original,
+        from bundle: Bundle = .main
+    ) throws -> [WikiMQAExample] {
+        guard let url = bundle.url(forResource: variant.bundleFilename, withExtension: "json") else {
+            throw WikiMQADatasetError.missingBundleFile(variant: variant)
         }
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode([WikiMQAExample].self, from: data)
@@ -52,12 +85,12 @@ enum WikiMQADataset {
 }
 
 enum WikiMQADatasetError: LocalizedError {
-    case missingBundleFile
+    case missingBundleFile(variant: WikiMQADatasetVariant)
 
     var errorDescription: String? {
         switch self {
-        case .missingBundleFile:
-            return "wikimqa_s.json not found in app bundle (add Resources/wikimqa_s.json)."
+        case .missingBundleFile(let variant):
+            return "\(variant.bundleFilename).json not found in app bundle."
         }
     }
 }

@@ -24,8 +24,16 @@
 		PCB000B2E0B0006000B0006 /* RamStressBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB000C2E0B0006000B0006 /* RamStressBenchmark.swift */; };
 		PCB000E2E0B0007000B0007 /* WikiMQADataset.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB000D2E0B0007000B0007 /* WikiMQADataset.swift */; };
 		PCB00102E0B0008000B0008 /* WikiMQABenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB000F2E0B0008000B0008 /* WikiMQABenchmark.swift */; };
+		PCB00142E0B000A00B000A /* MusiqueDataset.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00132E0B000A00B000A /* MusiqueDataset.swift */; };
+		PCB00162E0B000B00B000B /* MusiqueBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00152E0B000B00B000B /* MusiqueBenchmark.swift */; };
+		PCB00182E0B000C00B000C /* RagBenchmarkPrompts.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00172E0B000C00B000C /* RagBenchmarkPrompts.swift */; };
 		PCB00122E0B0009000B0009 /* wikimqa_s.json in Resources */ = {isa = PBXBuildFile; fileRef = PCB00112E0B0009000B0009 /* wikimqa_s.json */; };
-		PCB000A2E0B0005000B0005 /* QualityTestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00082E0B0005000B0005 /* QualityTestView.swift */; };
+		PCB001A2E0B000D00B000D /* musique_s.json in Resources */ = {isa = PBXBuildFile; fileRef = PCB00192E0B000D00B000D /* musique_s.json */; };
+		PCB00212E0B000E00B000E /* wikimqa_s_clean.json in Resources */ = {isa = PBXBuildFile; fileRef = PCB00202E0B000E00B000E /* wikimqa_s_clean.json */; };
+		PCB00232E0B000F00B000F /* IntegrationTestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00222E0B000F00B000F /* IntegrationTestView.swift */; };
+		PCB00252E0B001000B0010 /* BenchmarksView.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00242E0B001000B0010 /* BenchmarksView.swift */; };
+		PCB00272E0B001100B0011 /* FuseResidualProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00262E0B001100B0011 /* FuseResidualProbe.swift */; };
+		PCB00292E0B001200B0012 /* FuseResidualProbeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = PCB00282E0B001200B0012 /* FuseResidualProbeView.swift */; };
 		DD84C9FD2D747FED007778EC /* llama.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = DD84C9FC2D747FED007778EC /* llama.xcframework */; };
 		DD84C9FE2D747FED007778EC /* llama.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = DD84C9FC2D747FED007778EC /* llama.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		F1FE20E22B465ECA00B45541 /* LoadCustomButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */; };
@@ -64,8 +72,16 @@
 		PCB000C2E0B0006000B0006 /* RamStressBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RamStressBenchmark.swift; sourceTree = "<group>"; };
 		PCB000D2E0B0007000B0007 /* WikiMQADataset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WikiMQADataset.swift; sourceTree = "<group>"; };
 		PCB000F2E0B0008000B0008 /* WikiMQABenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WikiMQABenchmark.swift; sourceTree = "<group>"; };
+		PCB00132E0B000A00B000A /* MusiqueDataset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusiqueDataset.swift; sourceTree = "<group>"; };
+		PCB00152E0B000B00B000B /* MusiqueBenchmark.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusiqueBenchmark.swift; sourceTree = "<group>"; };
+		PCB00172E0B000C00B000C /* RagBenchmarkPrompts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RagBenchmarkPrompts.swift; sourceTree = "<group>"; };
 		PCB00112E0B0009000B0009 /* wikimqa_s.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = wikimqa_s.json; sourceTree = "<group>"; };
-		PCB00082E0B0005000B0005 /* QualityTestView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QualityTestView.swift; sourceTree = "<group>"; };
+		PCB00192E0B000D00B000D /* musique_s.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = musique_s.json; sourceTree = "<group>"; };
+		PCB00202E0B000E00B000E /* wikimqa_s_clean.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = wikimqa_s_clean.json; sourceTree = "<group>"; };
+		PCB00222E0B000F00B000F /* IntegrationTestView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntegrationTestView.swift; sourceTree = "<group>"; };
+		PCB00242E0B001000B0010 /* BenchmarksView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarksView.swift; sourceTree = "<group>"; };
+		PCB00262E0B001100B0011 /* FuseResidualProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuseResidualProbe.swift; sourceTree = "<group>"; };
+		PCB00282E0B001200B0012 /* FuseResidualProbeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuseResidualProbeView.swift; sourceTree = "<group>"; };
 		DD84C9FC2D747FED007778EC /* llama.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = llama.xcframework; path = "../llama.cpp/build-apple/llama.xcframework"; sourceTree = "<group>"; };
 		DF2D2FE72B4A59BE00FCB72D /* llama.cpp */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = llama.cpp; path = ../llama.cpp; sourceTree = "<group>"; };
 		F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadCustomButton.swift; sourceTree = "<group>"; };
@@ -110,6 +126,7 @@
 			children = (
 				8A3F84102AC4BD85005E2EE8 /* Resources */,
 				8A9F7C4B2AC332DC008AE1EA /* Models */,
+				PCB002A2E0B001300B0013 /* Diagnostics */,
 				8A9F7C4A2AC332BF008AE1EA /* UI */,
 				8A1C83762AC328BD0096AF73 /* llama_swiftuiApp.swift */,
 				8A1C837A2AC328BE0096AF73 /* Assets.xcassets */,
@@ -132,6 +149,8 @@
 			children = (
 				8A3F84112AC4BD8C005E2EE8 /* models */,
 				PCB00112E0B0009000B0009 /* wikimqa_s.json */,
+				PCB00202E0B000E00B000E /* wikimqa_s_clean.json */,
+				PCB00192E0B000D00B000D /* musique_s.json */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -156,11 +175,21 @@
 			children = (
 				7FA3D2B22B2EA2F600543F92 /* DownloadButton.swift */,
 				8A1C83782AC328BD0096AF73 /* ContentView.swift */,
-				PCB00082E0B0005000B0005 /* QualityTestView.swift */,
+				PCB00222E0B000F00B000F /* IntegrationTestView.swift */,
+				PCB00242E0B001000B0010 /* BenchmarksView.swift */,
 				F1FE20E12B465EC900B45541 /* LoadCustomButton.swift */,
 				79E1D9CC2B4CD16E005F8E46 /* InputButton.swift */,
 			);
 			path = UI;
+			sourceTree = "<group>";
+		};
+		PCB002A2E0B001300B0013 /* Diagnostics */ = {
+			isa = PBXGroup;
+			children = (
+				PCB00262E0B001100B0011 /* FuseResidualProbe.swift */,
+				PCB00282E0B001200B0012 /* FuseResidualProbeView.swift */,
+			);
+			path = Diagnostics;
 			sourceTree = "<group>";
 		};
 		8A9F7C4B2AC332DC008AE1EA /* Models */ = {
@@ -173,6 +202,9 @@
 				PCB000C2E0B0006000B0006 /* RamStressBenchmark.swift */,
 				PCB000D2E0B0007000B0007 /* WikiMQADataset.swift */,
 				PCB000F2E0B0008000B0008 /* WikiMQABenchmark.swift */,
+				PCB00132E0B000A00B000A /* MusiqueDataset.swift */,
+				PCB00152E0B000B00B000B /* MusiqueBenchmark.swift */,
+				PCB00172E0B000C00B000C /* RagBenchmarkPrompts.swift */,
 				8A9F7C4C2AC332EE008AE1EA /* LlamaState.swift */,
 			);
 			path = Models;
@@ -244,6 +276,8 @@
 			files = (
 				8A3F84242AC4C891005E2EE8 /* models in Resources */,
 				PCB00122E0B0009000B0009 /* wikimqa_s.json in Resources */,
+				PCB00212E0B000E00B000E /* wikimqa_s_clean.json in Resources */,
+				PCB001A2E0B000D00B000D /* musique_s.json in Resources */,
 				8A1C837B2AC328BE0096AF73 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -265,7 +299,13 @@
 				PCB000B2E0B0006000B0006 /* RamStressBenchmark.swift in Sources */,
 				PCB000E2E0B0007000B0007 /* WikiMQADataset.swift in Sources */,
 				PCB00102E0B0008000B0008 /* WikiMQABenchmark.swift in Sources */,
-				PCB000A2E0B0005000B0005 /* QualityTestView.swift in Sources */,
+				PCB00142E0B000A00B000A /* MusiqueDataset.swift in Sources */,
+				PCB00162E0B000B00B000B /* MusiqueBenchmark.swift in Sources */,
+				PCB00182E0B000C00B000C /* RagBenchmarkPrompts.swift in Sources */,
+				PCB00232E0B000F00B000F /* IntegrationTestView.swift in Sources */,
+				PCB00252E0B001000B0010 /* BenchmarksView.swift in Sources */,
+				PCB00272E0B001100B0011 /* FuseResidualProbe.swift in Sources */,
+				PCB00292E0B001200B0012 /* FuseResidualProbeView.swift in Sources */,
 				8A1C83792AC328BD0096AF73 /* ContentView.swift in Sources */,
 				8A1C83772AC328BD0096AF73 /* llama_swiftuiApp.swift in Sources */,
 				7FA3D2B32B2EA2F600543F92 /* DownloadButton.swift in Sources */,

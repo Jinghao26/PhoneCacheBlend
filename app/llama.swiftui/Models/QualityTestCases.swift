@@ -121,6 +121,7 @@ enum QualityTestSuiteKind: String, CaseIterable, Identifiable {
     case reuseMax = "Reuse max (8 queries)"
     case stitchProfile = "Stitch profile (Q1, Q2)"
     case q2WarmReuse = "Warm reuse (Q2 × 2)"
+    case ensureProfile = "Ensure profile (Q1,2,4,5,11,12)"
     case harder = "Harder_test (3 mega prompts)"
 
     var id: String { rawValue }
@@ -131,25 +132,26 @@ enum QualityTestSuiteKind: String, CaseIterable, Identifiable {
         case .reuseMax: return "Reuse-Max Benchmark (Simple_test Q1,2,4,5,6,7,11,12)"
         case .stitchProfile: return "Stitch Profile (Simple_test Q1, Q2 — baseline vs PCB)"
         case .q2WarmReuse: return "Warm Reuse Benchmark (Simple_test Q2 × 2)"
+        case .ensureProfile: return "Ensure Profile (Simple_test Q1,2,4,5,11,12 — baseline vs PCB)"
         case .harder: return "3-Query Quality Matrix (Harder_test)"
         }
     }
 
     var defaultMaxGenTokens: Int32 {
         switch self {
-        case .simple, .reuseMax, .stitchProfile, .q2WarmReuse: return 200
+        case .simple, .reuseMax, .stitchProfile, .q2WarmReuse, .ensureProfile: return 200
         case .harder: return 384
         }
     }
 
     /// When true, run all baseline queries then clear KV and run all PCB (maximizes cross-query reuse).
     var sequentialPathBenchmark: Bool {
-        self == .reuseMax || self == .stitchProfile || self == .q2WarmReuse
+        self == .reuseMax || self == .stitchProfile || self == .q2WarmReuse || self == .ensureProfile
     }
 
     /// Timing-only benchmark; skip pass/fail scoring emphasis.
     var timingOnlyBenchmark: Bool {
-        self == .stitchProfile || self == .q2WarmReuse
+        self == .stitchProfile || self == .q2WarmReuse || self == .ensureProfile
     }
 }
 
@@ -165,6 +167,7 @@ enum QualityTestSuite {
         case .reuseMax: return reuseMaxQueries
         case .stitchProfile: return stitchProfileQueries
         case .q2WarmReuse: return q2WarmReuseQueries
+        case .ensureProfile: return ensureProfileQueries
         case .harder: return harderQueries
         }
     }
@@ -174,9 +177,17 @@ enum QualityTestSuite {
 
     static let stitchProfileQueryIds = [1, 2]
 
+    /// Ensure-phase profile: overlapping Simple_test queries (cold → warm reuse builds).
+    static let ensureProfileQueryIds = [1, 2, 4, 5, 11, 12]
+
     static var stitchProfileQueries: [QualityTestQuery] {
         let byId = Dictionary(uniqueKeysWithValues: simpleQueries.map { ($0.id, $0) })
         return stitchProfileQueryIds.compactMap { byId[$0] }
+    }
+
+    static var ensureProfileQueries: [QualityTestQuery] {
+        let byId = Dictionary(uniqueKeysWithValues: simpleQueries.map { ($0.id, $0) })
+        return ensureProfileQueryIds.compactMap { byId[$0] }
     }
 
     /// Q2 twice (ids 201/202) — second PCB run should be all-cache HIT after warm-up.
@@ -468,6 +479,29 @@ enum QualityScorer {
 enum RagInferencePath: String {
     case standardLlama = "Standard llama (full prefill)"
     case phoneCacheBlend = "PhoneCacheBlend (cache+stitch+fuse)"
+    /// Modular KV reuse only: ensure + stitch, no CacheBlend fuse (recomp_ratio=0 semantics).
+    case phoneCacheBlendNoFuse = "PhoneCacheBlend no-fuse (cache+stitch, ratio=0)"
+
+    /// Uses chunk / prefix / label caches and stitch (PCB family).
+    var usesChunkCache: Bool {
+        switch self {
+        case .phoneCacheBlend, .phoneCacheBlendNoFuse: return true
+        case .standardLlama: return false
+        }
+    }
+
+    /// Runs GRAPH/TOKEN CacheBlend fuse after stitch.
+    var runsCacheBlendFuse: Bool {
+        self == .phoneCacheBlend
+    }
+
+    var shortTag: String {
+        switch self {
+        case .standardLlama: return "baseline"
+        case .phoneCacheBlend: return "pcb"
+        case .phoneCacheBlendNoFuse: return "pcb_nofuse"
+        }
+    }
 }
 
 struct RagQueryResult {
@@ -495,6 +529,10 @@ struct RagQueryResult {
     let stitchDiskLoads: Int?
     /// PCB: per-component stitch timings when collected.
     let stitchBreakdown: StitchTimingBreakdown?
+    /// PCB: per-component fuse timings when collected.
+    let fuseBreakdown: FuseTimingBreakdown?
+    /// PCB: per-component ensure timings when collected.
+    let ensureBreakdown: EnsureTimingBreakdown?
     /// Set when PCB fell back to full GPU prefill.
     let fallbackReason: String?
 }
@@ -514,4 +552,6 @@ struct QualityQueryRun {
     let cacheHits: Int?
     let cacheSaves: Int?
     let stitchBreakdown: StitchTimingBreakdown?
+    let fuseBreakdown: FuseTimingBreakdown?
+    let ensureBreakdown: EnsureTimingBreakdown?
 }

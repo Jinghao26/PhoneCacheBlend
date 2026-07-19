@@ -61,6 +61,11 @@ enum PhoneCacheBlendConfig {
     /// RAM hot slots for WikiMQA benchmarking (~64 × 17 MB ≈ 1.1 GB; leaves room for n_ctx=8192 query).
     static let wikiChunkRamMaxEntries = 64
 
+    /// MuSiQue 150 (~1,255 unique passages + prefix margin); same sizing as WikiMQA @8192.
+    static let musiqueChunkDiskMaxEntries = 1280
+    static let musiqueChunkRamMaxEntries = 64
+    static let nCtxMusique: UInt32 = 8192
+
     /// Default context for Simple_test and normal Ask flow.
     static let nCtxDefault: UInt32 = 2048
     /// Expanded context for Harder_test mega prompts (33 chunks).
@@ -110,6 +115,19 @@ enum PhoneCacheBlendConfig {
         4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64,
         68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 128
     ]
+
+    // MARK: - Wiki-scale benchmark thermal pacing (Metal @8192)
+
+    /// Seconds to wait between wiki-scale queries when thermal is nominal.
+    static let wikiBenchmarkInterQueryCooldownNominalSec: UInt64 = 3
+    /// Seconds between queries when thermal is fair.
+    static let wikiBenchmarkInterQueryCooldownFairSec: UInt64 = 8
+    /// Seconds between queries when thermal is serious/critical.
+    static let wikiBenchmarkInterQueryCooldownSeriousSec: UInt64 = 20
+    /// Max seconds to wait for thermal to drop below serious before continuing.
+    static let wikiBenchmarkThermalPauseMaxSec: UInt64 = 180
+    /// GPU reload + cooldown attempts per query on decode failure.
+    static let wikiBenchmarkMaxRetries = 3
 }
 
 @MainActor
@@ -244,20 +262,12 @@ class LlamaState: ObservableObject {
     }
 
     /// Build full RAG prompt: system + passages + question.
-    static func buildRagPrompt(passages: [String], question: String) -> String {
-        let trimmedPassages = passages
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        let body = trimmedPassages.enumerated().map { index, passage in
-            "[\(index + 1)] \(passage)"
-        }.joined(separator: "\n\n")
-
-        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
-        return PhoneCacheBlendConfig.systemPrefix
-            + body
-            + PhoneCacheBlendConfig.questionPrefix
-            + q
-            + PhoneCacheBlendConfig.answerPrefix
+    static func buildRagPrompt(
+        passages: [String],
+        question: String,
+        prompts: RagBenchmarkPrompts = .standard
+    ) -> String {
+        prompts.buildFullPrompt(passages: passages, question: question)
     }
 
     /// List index label prefilled fresh at stitch time (not part of cached body KV).
@@ -273,23 +283,39 @@ class LlamaState: ObservableObject {
     }
 
     /// Ensure each chunk KV is on disk (save on miss, FIFO eviction).
-    private func ensureSystemPrefixCached(llamaContext: LlamaContext) async -> ChunkCacheOpResult? {
+    private func ensureSystemPrefixCached(
+        llamaContext: LlamaContext,
+        prefixText: String = PhoneCacheBlendConfig.systemPrefix,
+        timing: inout EnsureTimingBreakdown
+    ) async -> ChunkCacheOpResult? {
         guard PhoneCacheBlendConfig.enableSystemPrefixCache,
               let chunkStore,
               let modelFilename = loadedModelFilename else { return nil }
 
-        let prefixText = PhoneCacheBlendConfig.systemPrefix
+        var t0 = DispatchTime.now().uptimeNanoseconds
         let chunkId = ChunkStore.prefixChunkId(modelFilename: modelFilename, prefixText: prefixText)
         let currentNCtx = await llamaContext.nCtx()
+        let isHit = chunkStore.hasValidCache(chunkId: chunkId, forNCtx: currentNCtx)
+        timing.lookupMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
 
-        if chunkStore.hasValidCache(chunkId: chunkId, forNCtx: currentNCtx) {
+        if isHit {
+            t0 = DispatchTime.now().uptimeNanoseconds
             try? chunkStore.touchExisting(chunkId: chunkId)
+            timing.touchMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+
+            t0 = DispatchTime.now().uptimeNanoseconds
+            let cachedTokens = chunkStore.metadata(for: chunkId)?.nTokens
+            timing.metaReadMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+
             let nTokens: Int
-            if let cached = chunkStore.metadata(for: chunkId)?.nTokens {
-                nTokens = cached
+            if let cachedTokens {
+                nTokens = cachedTokens
             } else {
+                t0 = DispatchTime.now().uptimeNanoseconds
                 nTokens = await llamaContext.tokenizePrefix(prefixText).count
+                timing.tokenizeMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
             }
+            timing.prefixHit = true
             return ChunkCacheOpResult(
                 chunkId: chunkId,
                 cacheHit: true,
@@ -306,6 +332,9 @@ class LlamaState: ObservableObject {
                 prefixText: prefixText,
                 binPath: binPath
             )
+            timing.tokenizeMs += stats.tokenizeMs
+            timing.prefillMs += stats.prefillMs
+            timing.storeMs += stats.storeMs
 
             let preview = String(prefixText.prefix(80).replacingOccurrences(of: "\n", with: " "))
             let metadata = ChunkMetadata(
@@ -319,23 +348,31 @@ class LlamaState: ObservableObject {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
+            t0 = DispatchTime.now().uptimeNanoseconds
             let metaData = try encoder.encode(metadata)
             try metaData.write(to: chunkStore.metaURL(chunkId: chunkId), options: .atomic)
+            timing.metaWriteMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
 
+            t0 = DispatchTime.now().uptimeNanoseconds
             let evicted = (try? chunkStore.registerSavedChunk(metadata)) ?? []
+            timing.registerMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
             chunkRamCache.removeAll(evicted)
 
-            if PhoneCacheBlendConfig.enableRamHotStitch,
-               let blob = await llamaContext.captureSequenceState(seqId: 0) {
-                chunkRamCache.put(chunkId: chunkId, stateData: blob, nTokens: stats.nTokens)
+            if PhoneCacheBlendConfig.enableRamHotStitch {
+                t0 = DispatchTime.now().uptimeNanoseconds
+                if let blob = await llamaContext.captureSequenceState(seqId: 0) {
+                    chunkRamCache.put(chunkId: chunkId, stateData: blob, nTokens: stats.nTokens)
+                }
+                timing.ramWarmMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
             }
 
+            timing.prefixHit = false
             return ChunkCacheOpResult(
                 chunkId: chunkId,
                 cacheHit: false,
                 nTokens: stats.nTokens,
-                prefillMs: stats.prefillMs,
-                saveMs: stats.saveMs,
+                prefillMs: stats.tokenizeMs + stats.prefillMs,
+                saveMs: stats.storeMs,
                 evictedChunkIds: evicted
             )
         } catch {
@@ -347,7 +384,8 @@ class LlamaState: ObservableObject {
     /// Ensure each chunk KV is on disk (save on miss, FIFO eviction).
     private func ensurePassagesCached(
         passages: [String],
-        llamaContext: LlamaContext
+        llamaContext: LlamaContext,
+        timing: inout EnsureTimingBreakdown
     ) async -> [ChunkCacheOpResult] {
         guard let chunkStore, let modelFilename = loadedModelFilename else { return [] }
 
@@ -355,17 +393,30 @@ class LlamaState: ObservableObject {
         let currentNCtx = await llamaContext.nCtx()
 
         for passage in passages {
+            var t0 = DispatchTime.now().uptimeNanoseconds
             let chunkId = ChunkStore.chunkId(modelFilename: modelFilename, passageContent: passage)
             let prefillText = ChunkStore.prefillText(for: passage)
+            let isHit = chunkStore.hasValidCache(chunkId: chunkId, forNCtx: currentNCtx)
+            timing.lookupMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
 
-            if chunkStore.hasValidCache(chunkId: chunkId, forNCtx: currentNCtx) {
+            if isHit {
+                t0 = DispatchTime.now().uptimeNanoseconds
                 try? chunkStore.touchExisting(chunkId: chunkId)
+                timing.touchMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+
+                t0 = DispatchTime.now().uptimeNanoseconds
+                let cachedTokens = chunkStore.metadata(for: chunkId)?.nTokens
+                timing.metaReadMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+
                 let nTokens: Int
-                if let cached = chunkStore.metadata(for: chunkId)?.nTokens {
-                    nTokens = cached
+                if let cachedTokens {
+                    nTokens = cachedTokens
                 } else {
+                    t0 = DispatchTime.now().uptimeNanoseconds
                     nTokens = await llamaContext.tokenizeChunk(prefillText).count
+                    timing.tokenizeMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
                 }
+                timing.passageHits += 1
                 results.append(ChunkCacheOpResult(
                     chunkId: chunkId,
                     cacheHit: true,
@@ -383,6 +434,9 @@ class LlamaState: ObservableObject {
                     prefillText: prefillText,
                     binPath: binPath
                 )
+                timing.tokenizeMs += stats.tokenizeMs
+                timing.prefillMs += stats.prefillMs
+                timing.storeMs += stats.storeMs
 
                 let trimmed = passage.trimmingCharacters(in: .whitespacesAndNewlines)
                 let preview = String(trimmed.prefix(80))
@@ -397,23 +451,31 @@ class LlamaState: ObservableObject {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 encoder.dateEncodingStrategy = .iso8601
+                t0 = DispatchTime.now().uptimeNanoseconds
                 let metaData = try encoder.encode(metadata)
                 try metaData.write(to: chunkStore.metaURL(chunkId: chunkId), options: .atomic)
+                timing.metaWriteMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
 
+                t0 = DispatchTime.now().uptimeNanoseconds
                 let evicted = (try? chunkStore.registerSavedChunk(metadata)) ?? []
+                timing.registerMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
                 chunkRamCache.removeAll(evicted)
 
-                if PhoneCacheBlendConfig.enableRamHotStitch,
-                   let blob = await llamaContext.captureSequenceState(seqId: 0) {
-                    chunkRamCache.put(chunkId: chunkId, stateData: blob, nTokens: stats.nTokens)
+                if PhoneCacheBlendConfig.enableRamHotStitch {
+                    t0 = DispatchTime.now().uptimeNanoseconds
+                    if let blob = await llamaContext.captureSequenceState(seqId: 0) {
+                        chunkRamCache.put(chunkId: chunkId, stateData: blob, nTokens: stats.nTokens)
+                    }
+                    timing.ramWarmMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
                 }
 
+                timing.passageMisses += 1
                 results.append(ChunkCacheOpResult(
                     chunkId: chunkId,
                     cacheHit: false,
                     nTokens: stats.nTokens,
-                    prefillMs: stats.prefillMs,
-                    saveMs: stats.saveMs,
+                    prefillMs: stats.tokenizeMs + stats.prefillMs,
+                    saveMs: stats.storeMs,
                     evictedChunkIds: evicted
                 ))
             } catch {
@@ -436,12 +498,21 @@ class LlamaState: ObservableObject {
     }
 
     /// RAM-only cache for `[n] ` label KV (reused across queries for the same model).
-    private func ensureLabelKvCached(listIndex: Int, llamaContext: LlamaContext) async -> LabelCacheOpResult? {
+    private func ensureLabelKvCached(
+        listIndex: Int,
+        llamaContext: LlamaContext,
+        timing: inout EnsureTimingBreakdown
+    ) async -> LabelCacheOpResult? {
         guard PhoneCacheBlendConfig.enableLabelKvCache,
               let modelFilename = loadedModelFilename else { return nil }
 
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let chunkId = ChunkStore.labelChunkId(modelFilename: modelFilename, listIndex: listIndex)
-        if let cached = labelRamCache.get(chunkId) {
+        let cached = labelRamCache.get(chunkId)
+        timing.labelLookupMs += Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
+
+        if let cached {
+            timing.labelHits += 1
             return LabelCacheOpResult(
                 listIndex: listIndex,
                 chunkId: chunkId,
@@ -453,7 +524,10 @@ class LlamaState: ObservableObject {
         let labelText = Self.formatChunkLabel(index: listIndex)
         do {
             let snap = try await llamaContext.collectLabelKvSnapshot(labelText: labelText)
+            timing.tokenizeMs += snap.tokenizeMs
+            timing.labelPrefillMs += snap.prefillMs + snap.captureMs
             labelRamCache.put(chunkId: chunkId, stateData: snap.data, nTokens: snap.nTokens)
+            timing.labelMisses += 1
             return LabelCacheOpResult(
                 listIndex: listIndex,
                 chunkId: chunkId,
@@ -466,15 +540,101 @@ class LlamaState: ObservableObject {
         }
     }
 
-    private func ensureLabelsCached(count: Int, llamaContext: LlamaContext) async -> [LabelCacheOpResult] {
+    private func ensureLabelsCached(
+        count: Int,
+        llamaContext: LlamaContext,
+        timing: inout EnsureTimingBreakdown
+    ) async -> [LabelCacheOpResult] {
         guard PhoneCacheBlendConfig.enableLabelKvCache else { return [] }
         var results: [LabelCacheOpResult] = []
         for idx in 0..<count {
-            if let result = await ensureLabelKvCached(listIndex: idx, llamaContext: llamaContext) {
+            if let result = await ensureLabelKvCached(
+                listIndex: idx,
+                llamaContext: llamaContext,
+                timing: &timing
+            ) {
                 results.append(result)
             }
         }
         return results
+    }
+
+    /// Prefill list labels `[1]…[N]` into RAM so later ensure paths are label HIT.
+    /// Returns wall time in ms (logged separately from per-query ensure).
+    @discardableResult
+    private func prewarmListLabels(count: Int, llamaContext: LlamaContext) async -> Double {
+        guard PhoneCacheBlendConfig.enableLabelKvCache, count > 0 else { return 0 }
+        var timing = EnsureTimingBreakdown()
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        _ = await ensureLabelsCached(count: count, llamaContext: llamaContext, timing: &timing)
+        let wallMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+        messageLog += String(
+            format: "  Labels: %d HIT / %d SAVE  prefill %.1f ms  lookup %.1f ms\n",
+            timing.labelHits,
+            timing.labelMisses,
+            timing.labelPrefillMs,
+            timing.labelLookupMs
+        )
+        return wallMs
+    }
+
+    /// Prefill system prefix KV (disk + RAM hot) so later ensure paths are prefix HIT.
+    /// Returns wall time in ms (logged separately from per-query ensure).
+    @discardableResult
+    private func prewarmSystemPrefix(
+        llamaContext: LlamaContext,
+        prefixText: String = PhoneCacheBlendConfig.systemPrefix
+    ) async -> Double {
+        guard PhoneCacheBlendConfig.enableSystemPrefixCache else { return 0 }
+        var timing = EnsureTimingBreakdown()
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        let result = await ensureSystemPrefixCached(
+            llamaContext: llamaContext,
+            prefixText: prefixText,
+            timing: &timing
+        )
+        let wallMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+        if let result {
+            messageLog += String(
+                format: "  Prefix: %@  %d tok  prefill %.1f ms  store %.1f ms  ram warm %.1f ms\n",
+                result.cacheHit ? "HIT" : "SAVE",
+                result.nTokens,
+                timing.prefillMs,
+                timing.storeMs,
+                timing.ramWarmMs
+            )
+        } else {
+            messageLog += "  Prefix: SKIP (cache unavailable)\n"
+        }
+        return wallMs
+    }
+
+    /// PCB benchmark shared warm-up: system prefix + labels `[1]…[labelCount]` before query loop.
+    /// Timed separately so per-query ensure stays HIT for prefix/labels.
+    @discardableResult
+    private func prewarmPcbBenchmarkCaches(
+        llamaContext: LlamaContext,
+        prompts: RagBenchmarkPrompts = .standard,
+        labelCount: Int = 10
+    ) async -> Double {
+        messageLog += "\n>>> PCB precompute (excluded from per-query ensure) <<<\n"
+        let prefixWarmMs = await prewarmSystemPrefix(
+            llamaContext: llamaContext,
+            prefixText: prompts.systemPrefix
+        )
+        messageLog += String(
+            format: ">>> Precompute system prefix: %.1f ms\n",
+            prefixWarmMs
+        )
+        let labelWarmMs = await prewarmListLabels(count: labelCount, llamaContext: llamaContext)
+        messageLog += String(
+            format: ">>> Precompute labels [1]…[%d]: %.1f ms\n",
+            labelCount,
+            labelWarmMs
+        )
+        let total = prefixWarmMs + labelWarmMs
+        messageLog += String(format: ">>> Shared warm-up total: %.1f ms\n\n", total)
+        return total
     }
 
     private func buildPrefixStitchItem(from result: ChunkCacheOpResult?) -> PrefixStitchItem? {
@@ -527,12 +687,13 @@ class LlamaState: ObservableObject {
         cacheResults: [ChunkCacheOpResult],
         questionSuffix: String,
         mode: String,
-        prefillQuestion: Bool = true
+        prefillQuestion: Bool = true,
+        prefixText: String = PhoneCacheBlendConfig.systemPrefix
     ) async throws -> ChunkStitchResult {
         let prefixItem = buildPrefixStitchItem(from: prefixCacheResult)
         let items = buildStitchItems(from: cacheResults)
         let result = try await llamaContext.completion_init_with_cached_chunks(
-            prefixText: PhoneCacheBlendConfig.systemPrefix,
+            prefixText: prefixText,
             prefixItem: prefixItem,
             chunkItems: items,
             questionSuffix: questionSuffix,
@@ -618,6 +779,8 @@ class LlamaState: ObservableObject {
         let stitchDetail: String?
         let recoveryPrefillMs: Double?
         let stitchBreakdown: StitchTimingBreakdown?
+        let fuseBreakdown: FuseTimingBreakdown?
+        let ensureBreakdown: EnsureTimingBreakdown?
 
         var accountedE2EMs: Double {
             (ensureMs ?? 0) + (stitchMs ?? 0) + (fuseMs ?? 0) + (questionPostFuseMs ?? 0) + firstTokenMs
@@ -627,7 +790,7 @@ class LlamaState: ObservableObject {
 
         func formattedLog(path: RagInferencePath, isFallbackRecovery: Bool, decodeSummary: String) -> String {
             var lines: [String] = []
-            if path == .phoneCacheBlend && !isFallbackRecovery {
+            if path.usesChunkCache && !isFallbackRecovery {
                 lines.append("--- Timing (PhoneCacheBlend) ---")
                 lines.append(String(format: "Prompt tokens:  %d", promptTokens))
                 if let ensureMs, let hits = cacheHits, let saves = cacheSaves {
@@ -635,6 +798,9 @@ class LlamaState: ObservableObject {
                         format: "Ensure:         %.1f ms  (%d HIT, %d SAVE — load cached KV or collect+write)",
                         ensureMs, hits, saves
                     ))
+                    if let ensureBreakdown {
+                        lines.append(ensureBreakdown.formattedLog(ensureTotalMs: ensureMs))
+                    }
                 }
                 if let stitchMs {
                     let stitchLabel = PhoneCacheBlendConfig.enableQuestionPrefillAfterFuse
@@ -651,14 +817,29 @@ class LlamaState: ObservableObject {
                     }
                 }
                 if let fuseMs {
-                    let suffixNote = PhoneCacheBlendConfig.enableQuestionPrefillAfterFuse
-                        ? ", suffix_len=0"
-                        : ""
-                    lines.append(String(
-                        format: "Fuse:           %.1f ms  (HKVD @ layer 1 + partial recompute, ratio %.2f)",
-                        fuseMs,
-                        PhoneCacheBlendConfig.hkvdRecompRatio
-                    ) + suffixNote)
+                    if path == .phoneCacheBlendNoFuse {
+                        lines.append(String(
+                            format: "Fuse:           %.1f ms  (SKIPPED — modular reuse only, recomp_ratio=0)",
+                            fuseMs
+                        ))
+                    } else {
+                        let suffixNote = PhoneCacheBlendConfig.enableQuestionPrefillAfterFuse
+                            ? ", suffix_len=0"
+                            : ""
+                        let syncNote: String = {
+                            guard let fuseBreakdown, fuseBreakdown.syncMs > 0.5 else { return "" }
+                            return String(format: "; post-sync %.1f ms", fuseBreakdown.syncMs)
+                        }()
+                        lines.append(String(
+                            format: "Fuse:           %.1f ms  (HKVD @ layer 1 + partial recompute, ratio %.2f%@)",
+                            fuseMs,
+                            PhoneCacheBlendConfig.hkvdRecompRatio,
+                            syncNote
+                        ) + suffixNote)
+                        if let fuseBreakdown {
+                            lines.append(fuseBreakdown.formattedLog(fuseTotalMs: fuseMs))
+                        }
+                    }
                 }
                 if let questionPostFuseMs {
                     lines.append(String(
@@ -749,7 +930,8 @@ class LlamaState: ObservableObject {
         label: String,
         path: RagInferencePath = .phoneCacheBlend,
         logToMessage: Bool = true,
-        preloadedCache: [ChunkCacheOpResult]? = nil
+        preloadedCache: [ChunkCacheOpResult]? = nil,
+        prompts: RagBenchmarkPrompts = .standard
     ) async -> RagQueryResult? {
         guard let llamaContext else {
             if logToMessage {
@@ -783,35 +965,55 @@ class LlamaState: ObservableObject {
         var prefixCacheResult: ChunkCacheOpResult?
         var labelCacheResults: [LabelCacheOpResult] = []
         var cacheEnsureEndNs = queryStartNs
+        var ensureBreakdown = EnsureTimingBreakdown()
 
-        if path == .phoneCacheBlend {
+        if path.usesChunkCache {
             if let preloadedCache, preloadedCache.count == passages.count {
                 cacheResults = preloadedCache
                 if PhoneCacheBlendConfig.enableSystemPrefixCache {
-                    prefixCacheResult = await ensureSystemPrefixCached(llamaContext: llamaContext)
+                    prefixCacheResult = await ensureSystemPrefixCached(
+                        llamaContext: llamaContext,
+                        prefixText: prompts.systemPrefix,
+                        timing: &ensureBreakdown
+                    )
                 }
             } else {
-                prefixCacheResult = await ensureSystemPrefixCached(llamaContext: llamaContext)
-                cacheResults = await ensurePassagesCached(passages: passages, llamaContext: llamaContext)
+                prefixCacheResult = await ensureSystemPrefixCached(
+                    llamaContext: llamaContext,
+                    prefixText: prompts.systemPrefix,
+                    timing: &ensureBreakdown
+                )
+                cacheResults = await ensurePassagesCached(
+                    passages: passages,
+                    llamaContext: llamaContext,
+                    timing: &ensureBreakdown
+                )
             }
             if PhoneCacheBlendConfig.enableLabelKvCache {
-                labelCacheResults = await ensureLabelsCached(count: passages.count, llamaContext: llamaContext)
+                labelCacheResults = await ensureLabelsCached(
+                    count: passages.count,
+                    llamaContext: llamaContext,
+                    timing: &ensureBreakdown
+                )
             }
             cacheEnsureEndNs = DispatchTime.now().uptimeNanoseconds
             if logToMessage {
                 logCacheEnsureResults(prefix: prefixCacheResult, passages: cacheResults, labels: labelCacheResults)
             }
+        } else {
+            ensureBreakdown = EnsureTimingBreakdown()
         }
 
-        let questionSuffix = PhoneCacheBlendConfig.questionPrefix
+        let questionSuffix = prompts.questionPrefix
             + trimmedQuestion
-            + PhoneCacheBlendConfig.answerPrefix
+            + prompts.answerPrefix
 
         var inferenceMode = path == .standardLlama ? "baseline_full_prefill" : "phase_c_reuse"
         var stitchSucceeded = false
         var stitchRamHits = 0
         var stitchDiskLoads = 0
         var stitchBreakdown: StitchTimingBreakdown?
+        var fuseBreakdown: FuseTimingBreakdown?
         var stitchPhaseEndNs = cacheEnsureEndNs
         var fusePhaseEndNs = cacheEnsureEndNs
         var questionPostFusePhaseEndNs = cacheEnsureEndNs
@@ -823,7 +1025,11 @@ class LlamaState: ObservableObject {
         var fallbackReason: String?
 
         if path == .standardLlama {
-            let prompt = Self.buildRagPrompt(passages: passages, question: trimmedQuestion)
+            let prompt = Self.buildRagPrompt(
+                passages: passages,
+                question: trimmedQuestion,
+                prompts: prompts
+            )
             await llamaContext.clear()
             do {
                 _ = try await llamaContext.completion_init(text: prompt, mode: "baseline_full_prefill")
@@ -840,18 +1046,18 @@ class LlamaState: ObservableObject {
                     throw LlamaError.couldNotLoadCachedChunk
                 }
 
-                let deferQuestion = PhoneCacheBlendConfig.enableQuestionPrefillAfterFuse
-                    && PhoneCacheBlendConfig.enableCacheBlendFuse
+                let runFuse = path.runsCacheBlendFuse && PhoneCacheBlendConfig.enableCacheBlendFuse
+                let deferQuestion = PhoneCacheBlendConfig.enableQuestionPrefillAfterFuse && runFuse
 
                 let fullStitchTokens = await llamaContext.buildStitchTokenList(
-                    prefixText: PhoneCacheBlendConfig.systemPrefix,
+                    prefixText: prompts.systemPrefix,
                     passages: passages,
                     questionSuffix: questionSuffix,
                     includeQuestion: true
                 )
                 let fuseTokens = deferQuestion
                     ? await llamaContext.buildStitchTokenList(
-                        prefixText: PhoneCacheBlendConfig.systemPrefix,
+                        prefixText: prompts.systemPrefix,
                         passages: passages,
                         questionSuffix: questionSuffix,
                         includeQuestion: false
@@ -869,7 +1075,8 @@ class LlamaState: ObservableObject {
                     cacheResults: cacheResults,
                     questionSuffix: deferQuestion ? "" : questionSuffix,
                     mode: "phase_c_reuse",
-                    prefillQuestion: !deferQuestion
+                    prefillQuestion: !deferQuestion,
+                    prefixText: prompts.systemPrefix
                 )
                 stitchRamHits = stitchResult.ramHits
                 stitchDiskLoads = stitchResult.diskLoads
@@ -897,11 +1104,11 @@ class LlamaState: ObservableObject {
 
                 var precomputedIndices: [UInt32]?
 
-                if PhoneCacheBlendConfig.enableHkvdProbe {
+                if runFuse && PhoneCacheBlendConfig.enableHkvdProbe {
                     do {
                         let probe = try await llamaContext.probeHkvdIndices(
                             checkLayer: checkLayer,
-                            prefixText: PhoneCacheBlendConfig.systemPrefix,
+                            prefixText: prompts.systemPrefix,
                             passages: passages,
                             questionSuffix: questionSuffix,
                             suffixTokenCount: suffixTokenCount,
@@ -918,7 +1125,8 @@ class LlamaState: ObservableObject {
                             cacheResults: cacheResults,
                             questionSuffix: deferQuestion ? "" : questionSuffix,
                             mode: "phase_c_reuse",
-                            prefillQuestion: !deferQuestion
+                            prefillQuestion: !deferQuestion,
+                            prefixText: prompts.systemPrefix
                         )
                         stitchBreakdown = restitch.timing
                         await llamaContext.setStitchTokenList(deferQuestion ? fuseTokens : fullStitchTokens)
@@ -930,7 +1138,7 @@ class LlamaState: ObservableObject {
                     }
                 }
 
-                if PhoneCacheBlendConfig.enableCacheBlendFuse {
+                if runFuse {
                     let fuseSuffixLen: UInt32 = deferQuestion ? 0 : suffixTokenCount
                     let fuseInputTokens = deferQuestion ? fuseTokens : fullStitchTokens
                     do {
@@ -946,6 +1154,7 @@ class LlamaState: ObservableObject {
                         if logToMessage {
                             messageLog += "\n" + fuse.summary
                         }
+                        fuseBreakdown = fuse.timing
                         fuseRan = true
                         fusePhaseEndNs = DispatchTime.now().uptimeNanoseconds
                         try await prefillQuestionAfterFuseIfNeeded()
@@ -962,7 +1171,8 @@ class LlamaState: ObservableObject {
                                 cacheResults: cacheResults,
                                 questionSuffix: deferQuestion ? "" : questionSuffix,
                                 mode: "phase_c_reuse",
-                                prefillQuestion: !deferQuestion
+                                prefillQuestion: !deferQuestion,
+                                prefixText: prompts.systemPrefix
                             )
                             await llamaContext.setStitchTokenList(deferQuestion ? fuseTokens : fullStitchTokens)
                             markStitchComplete()
@@ -978,6 +1188,7 @@ class LlamaState: ObservableObject {
                             if logToMessage {
                                 messageLog += "\n" + fuse.summary
                             }
+                            fuseBreakdown = fuse.timing
                             fuseRan = true
                             fusePhaseEndNs = DispatchTime.now().uptimeNanoseconds
                             try await prefillQuestionAfterFuseIfNeeded()
@@ -993,7 +1204,8 @@ class LlamaState: ObservableObject {
                                 cacheResults: cacheResults,
                                 questionSuffix: questionSuffix,
                                 mode: "phase_c_reuse",
-                                prefillQuestion: true
+                                prefillQuestion: true,
+                                prefixText: prompts.systemPrefix
                             )
                             await llamaContext.setStitchTokenList(fullStitchTokens)
                             markStitchComplete()
@@ -1003,11 +1215,19 @@ class LlamaState: ObservableObject {
                         }
                     }
                 } else {
+                    if path == .phoneCacheBlendNoFuse, logToMessage {
+                        messageLog += "\n--- Fuse SKIPPED (pcb_nofuse / recomp_ratio=0, modular reuse only) ---\n"
+                    }
                     fusePhaseEndNs = stitchPhaseEndNs
                     questionPostFusePhaseEndNs = stitchPhaseEndNs
+                    inferenceMode = path == .phoneCacheBlendNoFuse ? "phase_c_reuse_nofuse" : "phase_c_reuse"
                 }
             } catch {
-                let fallbackPrompt = Self.buildRagPrompt(passages: passages, question: trimmedQuestion)
+                let fallbackPrompt = Self.buildRagPrompt(
+                    passages: passages,
+                    question: trimmedQuestion,
+                    prompts: prompts
+                )
                 fallbackReason = error.localizedDescription
                 if logToMessage {
                     if stitchSucceeded {
@@ -1069,7 +1289,7 @@ class LlamaState: ObservableObject {
         let cacheHits = passageHits + prefixHit + labelHits
         let cacheSaves = passageSaves + prefixSave + labelSaves
 
-        let ensureMs: Double? = path == .phoneCacheBlend
+        let ensureMs: Double? = path.usesChunkCache
             ? Double(cacheEnsureEndNs - queryStartNs) / 1_000_000.0
             : nil
 
@@ -1110,7 +1330,7 @@ class LlamaState: ObservableObject {
             ? "prefix + "
             : ""
         let stitchDetail: String?
-        if path == .phoneCacheBlend {
+        if path.usesChunkCache {
             if PhoneCacheBlendConfig.enableRamHotStitch {
                 stitchDetail = String(
                     format: "RAM %d / disk %d of %@%d chunks",
@@ -1131,11 +1351,13 @@ class LlamaState: ObservableObject {
             questionPostFuseMs: questionPostFuseMsForLog,
             firstTokenMs: firstTokenMs,
             e2eTtftMs: finalE2eMs,
-            cacheHits: path == .phoneCacheBlend ? cacheHits : nil,
-            cacheSaves: path == .phoneCacheBlend ? cacheSaves : nil,
+            cacheHits: path.usesChunkCache ? cacheHits : nil,
+            cacheSaves: path.usesChunkCache ? cacheSaves : nil,
             stitchDetail: stitchDetail,
             recoveryPrefillMs: recoveryPrefillMs,
-            stitchBreakdown: stitchBreakdown
+            stitchBreakdown: stitchBreakdown,
+            fuseBreakdown: fuseBreakdown,
+            ensureBreakdown: path.usesChunkCache ? ensureBreakdown : nil
         )
 
         if logToMessage {
@@ -1160,13 +1382,15 @@ class LlamaState: ObservableObject {
             stitchMs: stitchMs,
             fuseMs: fuseMs,
             firstTokenMs: firstTokenMs,
-            cacheHits: path == .phoneCacheBlend ? cacheHits : nil,
-            cacheSaves: path == .phoneCacheBlend ? cacheSaves : nil,
-            passageCacheHits: path == .phoneCacheBlend ? passageHits : nil,
-            passageCacheSaves: path == .phoneCacheBlend ? passageSaves : nil,
-            stitchRamHits: path == .phoneCacheBlend ? stitchRamHits : nil,
-            stitchDiskLoads: path == .phoneCacheBlend ? stitchDiskLoads : nil,
+            cacheHits: path.usesChunkCache ? cacheHits : nil,
+            cacheSaves: path.usesChunkCache ? cacheSaves : nil,
+            passageCacheHits: path.usesChunkCache ? passageHits : nil,
+            passageCacheSaves: path.usesChunkCache ? passageSaves : nil,
+            stitchRamHits: path.usesChunkCache ? stitchRamHits : nil,
+            stitchDiskLoads: path.usesChunkCache ? stitchDiskLoads : nil,
             stitchBreakdown: stitchBreakdown,
+            fuseBreakdown: fuseBreakdown,
+            ensureBreakdown: path.usesChunkCache ? ensureBreakdown : nil,
             fallbackReason: fallbackReason
         )
     }
@@ -1273,6 +1497,106 @@ class LlamaState: ObservableObject {
         isInferring = false
     }
 
+    /// Diagnostics: two fuse cases that attribute residual to Metal sync vs logits prime.
+    func runFuseResidualProbe() async {
+        isInferring = true
+        defer { isInferring = false }
+
+        guard let llamaContext = self.llamaContext, loadedModelPath != nil else {
+            messageLog += "Load a model first (Models → Qwen).\n"
+            return
+        }
+
+        do {
+            try await ensureContextCapacity(nCtx: PhoneCacheBlendConfig.nCtxDefault)
+        } catch {
+            messageLog += "Failed to resize context: \(error.localizedDescription)\n"
+            return
+        }
+
+        let passages = FuseResidualProbe.passages
+        let question = FuseResidualProbe.question
+        let prompts = RagBenchmarkPrompts.standard
+        let questionSuffix = prompts.questionPrefix + question + prompts.answerPrefix
+
+        messageLog += "\n"
+        messageLog += "(Fuse residual probe starting — ensure + stitch + fuse ×2, no generation)\n"
+
+        var caseResults: [FuseResidualProbe.CaseResult] = []
+
+        do {
+            var ensureBreakdown = EnsureTimingBreakdown()
+            let prefixCacheResult = await ensureSystemPrefixCached(
+                llamaContext: llamaContext,
+                prefixText: prompts.systemPrefix,
+                timing: &ensureBreakdown
+            )
+            let cacheResults = await ensurePassagesCached(
+                passages: passages,
+                llamaContext: llamaContext,
+                timing: &ensureBreakdown
+            )
+            if PhoneCacheBlendConfig.enableLabelKvCache {
+                _ = await ensureLabelsCached(
+                    count: passages.count,
+                    llamaContext: llamaContext,
+                    timing: &ensureBreakdown
+                )
+            }
+            logCacheEnsureResults(prefix: prefixCacheResult, passages: cacheResults)
+
+            let fuseTokens = await llamaContext.buildStitchTokenList(
+                prefixText: prompts.systemPrefix,
+                passages: passages,
+                questionSuffix: questionSuffix,
+                includeQuestion: false
+            )
+            let checkLayer = await llamaContext.defaultHkvdCheckLayer()
+
+            for caseID in FuseResidualProbe.CaseID.allCases {
+                messageLog += "\n>>> Preparing \(caseID.title)…\n"
+                _ = try await stitchFromCache(
+                    llamaContext: llamaContext,
+                    prefixCacheResult: prefixCacheResult,
+                    cacheResults: cacheResults,
+                    questionSuffix: "",
+                    mode: "phase_c_reuse",
+                    prefillQuestion: false,
+                    prefixText: prompts.systemPrefix
+                )
+                await llamaContext.setStitchTokenList(fuseTokens)
+
+                let fuse = try await llamaContext.cacheBlendFuse(
+                    tokens: fuseTokens,
+                    suffixLen: 0,
+                    checkLayer: checkLayer,
+                    recompRatio: PhoneCacheBlendConfig.hkvdRecompRatio,
+                    mode: PhoneCacheBlendConfig.cacheBlendFuseMode,
+                    impIndices: nil,
+                    requireSamplingLogits: caseID.requireSamplingLogits,
+                    throwOnMissingLogits: false
+                )
+
+                caseResults.append(
+                    FuseResidualProbe.CaseResult(
+                        caseID: caseID,
+                        nTokens: fuse.nTokens,
+                        impCount: fuse.indices.count,
+                        fuseMs: fuse.fuseMs,
+                        timing: fuse.timing
+                    )
+                )
+            }
+
+            let report = FuseResidualProbe.Report(cases: caseResults)
+            messageLog += "\n" + report.formattedLog() + "\n"
+        } catch {
+            messageLog += "Fuse residual probe failed: \(error.localizedDescription)\n"
+        }
+
+        await llamaContext.clear()
+    }
+
     /// Run all queries in a quality suite — baseline and PhoneCacheBlend side by side.
     func runQualityMatrix(
         suite: QualityTestSuiteKind = .simple,
@@ -1314,6 +1638,8 @@ class LlamaState: ObservableObject {
             messageLog += "  Timing focus: stitch deserialize / memcpy / GPU (each incl. Metal fence)\n"
         } else if suite == .q2WarmReuse {
             messageLog += "  Timing focus: Q2 cold vs warm PCB (ensure HIT on run 2)\n"
+        } else if suite == .ensureProfile {
+            messageLog += "  Timing focus: ensure lookup / meta / prefill / store / register / RAM warm / labels\n"
         } else {
             messageLog += "  Pass threshold: \(Int(QualityTestSuite.passThreshold * 100))% key phrases\n"
         }
@@ -1331,11 +1657,18 @@ class LlamaState: ObservableObject {
             messageLog += "  Order: Q\(QualityTestSuite.stitchProfileQueryIds.map(String.init).joined(separator: ", Q"))\n"
             messageLog += "  Phase 1: baseline (prefill + E2E TTFT)\n"
             messageLog += "  Phase 2: Clear KV → PCB (ensure + stitch breakdown + fuse + 1st token)\n"
+            messageLog += "  Fuse line: indices / attn / post-sync (Metal drain) / logits (+ FULL A C SUB)\n"
         }
         if suite == .q2WarmReuse {
             messageLog += "  Order: Q2 run 1, Q2 run 2 (same passages + question)\n"
             messageLog += "  Phase 1: baseline Q2 × 2 (full prefill each; no chunk cache)\n"
             messageLog += "  Phase 2: Clear KV → PCB Q2 × 2 (run 2 should be all HIT / warm)\n"
+        }
+        if suite == .ensureProfile {
+            messageLog += "  Order: Q\(QualityTestSuite.ensureProfileQueryIds.map(String.init).joined(separator: ", Q"))\n"
+            messageLog += "  Phase 1: baseline (full prefill each query)\n"
+            messageLog += "  Phase 2: Clear KV → precompute prefix + labels [1]…[10] → PCB sequential\n"
+            messageLog += "  (Prefix/label warm-up timed separately; per-query ensure should HIT both)\n"
         }
         messageLog += "========================================\n"
 
@@ -1426,6 +1759,26 @@ class LlamaState: ObservableObject {
             if path == .phoneCacheBlend {
                 messageLog += "\n>>> Clear KV before PhoneCacheBlend phase <<<\n"
                 clearChunkCache()
+
+                if suite == .ensureProfile {
+                    let prefixWarmMs = await prewarmSystemPrefix(llamaContext: llamaContext)
+                    messageLog += String(
+                        format: ">>> Precompute system prefix: %.1f ms (excluded from per-query ensure)\n",
+                        prefixWarmMs
+                    )
+                    let labelWarmMs = await prewarmListLabels(
+                        count: 10,
+                        llamaContext: llamaContext
+                    )
+                    messageLog += String(
+                        format: ">>> Precompute labels [1]…[10]: %.1f ms (excluded from per-query ensure)\n",
+                        labelWarmMs
+                    )
+                    messageLog += String(
+                        format: ">>> Shared warm-up total: %.1f ms\n",
+                        prefixWarmMs + labelWarmMs
+                    )
+                }
             }
 
             let phaseLabel = path == .standardLlama ? "Phase 1 — Baseline" : "Phase 2 — PhoneCacheBlend"
@@ -1488,7 +1841,9 @@ class LlamaState: ObservableObject {
             firstTokenMs: result.firstTokenMs,
             cacheHits: result.cacheHits,
             cacheSaves: result.cacheSaves,
-            stitchBreakdown: result.stitchBreakdown
+            stitchBreakdown: result.stitchBreakdown,
+            fuseBreakdown: result.fuseBreakdown,
+            ensureBreakdown: result.ensureBreakdown
         )
     }
 
@@ -1525,6 +1880,26 @@ class LlamaState: ObservableObject {
                         bd.clearMs, bd.deserializeMs, bd.memcpyMs,
                         bd.labelGpuMs + bd.labelCacheMs, bd.questionGpuMs, bd.questionPostFuseMs,
                         bd.coreMs, stitchMs
+                    )
+                }
+                if let fb = run.fuseBreakdown, let fuseMs = run.fuseMs {
+                    messageLog += fb.integrationLine(fuseTotalMs: fuseMs) + "\n"
+                }
+                if suite == .ensureProfile, let eb = run.ensureBreakdown, let ensureMs = run.cacheEnsureMs {
+                    messageLog += String(
+                        format: "  ensure: lookup %.1f  meta %.1f  tok %.1f  prefill %.1f  store %.1f  reg %.1f  ram %.1f  label %.1f  (%dH/%dS, sum %.1f / %.1f)\n",
+                        eb.lookupMs,
+                        eb.metaReadMs + eb.metaWriteMs,
+                        eb.tokenizeMs,
+                        eb.prefillMs,
+                        eb.storeMs,
+                        eb.registerMs + eb.touchMs,
+                        eb.ramWarmMs,
+                        eb.labelLookupMs + eb.labelPrefillMs,
+                        eb.passageHits,
+                        eb.passageMisses,
+                        eb.accountedMs,
+                        ensureMs
                     )
                 }
             }
@@ -1601,7 +1976,7 @@ class LlamaState: ObservableObject {
         }
 
         if paths.contains(.standardLlama) && paths.contains(.phoneCacheBlend) {
-            if suite != .stitchProfile && suite != .q2WarmReuse {
+            if suite != .stitchProfile && suite != .q2WarmReuse && suite != .ensureProfile {
                 appendPerQueryPerformanceTable(allRuns: allRuns, allQueries: allQueries)
             }
 
@@ -1618,7 +1993,7 @@ class LlamaState: ObservableObject {
                 else if b.score.score > p.score.score { baselineWins += 1 }
             }
             let ties = queryCount - pcbWins - baselineWins
-            if suite != .stitchProfile && suite != .q2WarmReuse {
+            if suite != .stitchProfile && suite != .q2WarmReuse && suite != .ensureProfile {
                 messageLog += "Quality head-to-head: PCB better \(pcbWins), baseline better \(baselineWins), ties \(ties)\n"
             }
         }
@@ -1629,8 +2004,90 @@ class LlamaState: ObservableObject {
         if suite == .q2WarmReuse {
             appendQ2WarmReuseSummary(allRuns: allRuns, allQueries: allQueries)
         }
+        if suite == .ensureProfile {
+            appendEnsureProfileSummary(allRuns: allRuns, allQueries: allQueries)
+        }
 
         messageLog += "\nDone.\n"
+    }
+
+    private func appendEnsureProfileSummary(
+        allRuns: [QualityQueryRun],
+        allQueries: [QualityTestQuery]
+    ) {
+        func avg(_ values: [Double]) -> Double {
+            values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+        }
+
+        messageLog += "\n--- Ensure profile: baseline vs PCB E2E ---\n"
+        messageLog += "Q   Baseline  PCB      Speedup  Ensure  Prefill  Store   Lookup\n"
+        for query in allQueries {
+            guard let b = allRuns.first(where: { $0.path == .standardLlama && $0.query.id == query.id }),
+                  let p = allRuns.first(where: { $0.path == .phoneCacheBlend && $0.query.id == query.id }) else {
+                continue
+            }
+            let speedup = p.e2eTtftMs > 0 ? b.e2eTtftMs / p.e2eTtftMs : 0
+            let eb = p.ensureBreakdown
+            messageLog += String(
+                format: "Q%-2d %8.0f %8.0f %7.2fx %7.0f %8.0f %7.0f %7.1f\n",
+                query.id,
+                b.e2eTtftMs,
+                p.e2eTtftMs,
+                speedup,
+                p.cacheEnsureMs ?? 0,
+                eb?.prefillMs ?? 0,
+                eb?.storeMs ?? 0,
+                eb?.lookupMs ?? 0
+            )
+        }
+
+        let pcb = allRuns.filter { $0.path == .phoneCacheBlend }
+        let breakdowns = pcb.compactMap(\.ensureBreakdown)
+        guard !breakdowns.isEmpty else { return }
+
+        messageLog += "\n--- PCB ensure component means (ms) ---\n"
+        messageLog += String(format: "  Lookup:        %.1f\n", avg(breakdowns.map(\.lookupMs)))
+        messageLog += String(format: "  Meta read:     %.1f\n", avg(breakdowns.map(\.metaReadMs)))
+        messageLog += String(format: "  Touch:         %.1f\n", avg(breakdowns.map(\.touchMs)))
+        messageLog += String(format: "  Tokenize:      %.1f\n", avg(breakdowns.map(\.tokenizeMs)))
+        messageLog += String(format: "  Prefill (GPU): %.1f\n", avg(breakdowns.map(\.prefillMs)))
+        messageLog += String(format: "  Store (.bin):  %.1f\n", avg(breakdowns.map(\.storeMs)))
+        messageLog += String(format: "  Meta write:    %.1f\n", avg(breakdowns.map(\.metaWriteMs)))
+        messageLog += String(format: "  Register/FIFO: %.1f\n", avg(breakdowns.map(\.registerMs)))
+        messageLog += String(format: "  RAM warm:      %.1f\n", avg(breakdowns.map(\.ramWarmMs)))
+        messageLog += String(format: "  Label lookup:  %.1f\n", avg(breakdowns.map(\.labelLookupMs)))
+        messageLog += String(format: "  Label prefill: %.1f  (expect ~0 after [1]…[10] prewarm)\n", avg(breakdowns.map(\.labelPrefillMs)))
+        messageLog += String(
+            format: "  Label HIT/MISS: %d / %d  (expect all HIT)\n",
+            breakdowns.map(\.labelHits).reduce(0, +),
+            breakdowns.map(\.labelMisses).reduce(0, +)
+        )
+        messageLog += String(
+            format: "  Passage HIT/SAVE: %d / %d across run\n",
+            breakdowns.map(\.passageHits).reduce(0, +),
+            breakdowns.map(\.passageMisses).reduce(0, +)
+        )
+
+        if pcb.count >= 2, let first = pcb.first, let last = pcb.last {
+            messageLog += "\n--- Cold (Q\(first.query.id)) vs late (Q\(last.query.id)) ensure ---\n"
+            messageLog += String(
+                format: "  Ensure total:  %.0f → %.0f ms  (HIT %d→%d)\n",
+                first.cacheEnsureMs ?? 0,
+                last.cacheEnsureMs ?? 0,
+                first.ensureBreakdown?.passageHits ?? 0,
+                last.ensureBreakdown?.passageHits ?? 0
+            )
+            messageLog += String(
+                format: "  Prefill GPU:   %.0f → %.0f ms\n",
+                first.ensureBreakdown?.prefillMs ?? 0,
+                last.ensureBreakdown?.prefillMs ?? 0
+            )
+            messageLog += String(
+                format: "  Store:         %.0f → %.0f ms\n",
+                first.ensureBreakdown?.storeMs ?? 0,
+                last.ensureBreakdown?.storeMs ?? 0
+            )
+        }
     }
 
     private func appendQ2WarmReuseSummary(
@@ -2059,14 +2516,19 @@ class LlamaState: ObservableObject {
     ) async -> (passages: [String], cachedCount: Int, aborted: Bool) {
         guard targetCount > 0 else { return ([], 0, false) }
 
-        _ = await ensureSystemPrefixCached(llamaContext: llamaContext)
+        var discardTiming = EnsureTimingBreakdown()
+        _ = await ensureSystemPrefixCached(llamaContext: llamaContext, timing: &discardTiming)
         var cachedCount = 0
 
         for idx in 0..<targetCount {
             let passage = RamStressPassages.passageText(index: idx, scale: scale)
             messageLog += String(format: "  · saving passage %d/%d… ", idx + 1, targetCount)
             let oneStart = DispatchTime.now().uptimeNanoseconds
-            let batch = await ensurePassagesCached(passages: [passage], llamaContext: llamaContext)
+            let batch = await ensurePassagesCached(
+                passages: [passage],
+                llamaContext: llamaContext,
+                timing: &discardTiming
+            )
             let oneMs = Double(DispatchTime.now().uptimeNanoseconds - oneStart) / 1_000_000
             if let result = batch.first {
                 cachedCount += 1
@@ -2090,7 +2552,11 @@ class LlamaState: ObservableObject {
         let aborted = cachedCount < targetCount
         if PhoneCacheBlendConfig.enableLabelKvCache, cachedCount > 0 {
             for idx in 0..<cachedCount {
-                _ = await ensureLabelKvCached(listIndex: idx, llamaContext: llamaContext)
+                _ = await ensureLabelKvCached(
+                    listIndex: idx,
+                    llamaContext: llamaContext,
+                    timing: &discardTiming
+                )
             }
         }
 
@@ -2206,7 +2672,11 @@ class LlamaState: ObservableObject {
     }
 
     /// WikiMQA benchmark for one path: baseline full prefill or PhoneCacheBlend (disk 1280, RAM 64).
-    func runWikiMQABenchmark(maxQueries: Int, path: RagInferencePath) async {
+    func runWikiMQABenchmark(
+        maxQueries: Int,
+        path: RagInferencePath,
+        dataset: WikiMQADatasetVariant = .original
+    ) async {
         isInferring = true
         guard loadedModelPath != nil else {
             messageLog += "Load a model first (Models → Qwen).\n"
@@ -2215,13 +2685,13 @@ class LlamaState: ObservableObject {
         }
 
         let priorRamCap = chunkRamCache.stats().maxEntries
-        if path == .phoneCacheBlend {
+        if path.usesChunkCache {
             ChunkCacheConfig.setStressDiskMaxEntries(PhoneCacheBlendConfig.wikiChunkDiskMaxEntries)
             chunkRamCache.setMaxEntries(PhoneCacheBlendConfig.wikiChunkRamMaxEntries)
         }
 
         defer {
-            if path == .phoneCacheBlend {
+            if path.usesChunkCache {
                 ChunkCacheConfig.setStressDiskMaxEntries(nil)
                 chunkRamCache.setMaxEntries(priorRamCap)
             }
@@ -2230,14 +2700,15 @@ class LlamaState: ObservableObject {
 
         let examples: [WikiMQAExample]
         do {
-            examples = try WikiMQADataset.load()
+            examples = try WikiMQADataset.load(variant: dataset)
         } catch {
-            messageLog += "WikiMQA dataset load failed: \(error.localizedDescription)\n"
+            messageLog += "\(dataset.logLabel) dataset load failed: \(error.localizedDescription)\n"
             return
         }
 
         let queryCount = min(max(1, maxQueries), examples.count)
-        let arm: WikiMQABenchmarkArm = path == .standardLlama ? .baseline : .pcb
+        let arm = WikiMQABenchmarkArm(path: path)
+        let datasetLabel = dataset.logLabel
 
         do {
             try await ensureContextCapacity(nCtx: PhoneCacheBlendConfig.nCtxWikiMQA)
@@ -2246,7 +2717,7 @@ class LlamaState: ObservableObject {
             return
         }
 
-        messageLog += "Fresh GPU context for WikiMQA @8192 (Metal stability)…\n"
+        messageLog += "Fresh GPU context for \(datasetLabel) @8192 (Metal stability)…\n"
         do {
             try await reloadLlamaContextAtNCtx(PhoneCacheBlendConfig.nCtxWikiMQA)
         } catch {
@@ -2259,14 +2730,30 @@ class LlamaState: ObservableObject {
         let overallStart = DispatchTime.now().uptimeNanoseconds
 
         messageLog += "\n========================================\n"
-        messageLog += "  WikiMQA \(arm.rawValue)\n"
+        messageLog += "  \(datasetLabel) \(arm.rawValue)\n"
         messageLog += "  n_ctx=\(PhoneCacheBlendConfig.nCtxWikiMQA)\n"
-        if path == .phoneCacheBlend {
+        if path.usesChunkCache {
             messageLog += "  Cache: disk \(PhoneCacheBlendConfig.wikiChunkDiskMaxEntries), RAM hot \(PhoneCacheBlendConfig.wikiChunkRamMaxEntries)\n"
+            messageLog += "  Precompute: system prefix + labels [1]…[10] before queries\n"
         }
         messageLog += "  Queries: \(queryCount)/\(examples.count)\n"
-        messageLog += "  Corpus: 1,055 unique passages, 10 per query\n"
+        messageLog += "  \(dataset.corpusNote)\n"
+        messageLog += "  Thermal: \(Self.thermalStateLabel())"
+        if Self.isThermalStressed() {
+            messageLog += " — waiting for cooldown (plug in, remove case)…\n"
+            await pauseForThermalIfNeeded()
+        } else {
+            messageLog += "\n"
+        }
         messageLog += "========================================\n\n"
+
+        if path.usesChunkCache, let llamaContext {
+            _ = await prewarmPcbBenchmarkCaches(
+                llamaContext: llamaContext,
+                prompts: .standard,
+                labelCount: 10
+            )
+        }
 
         let stats = await runWikiMQABenchmarkPhase(
             examples: examples,
@@ -2282,7 +2769,7 @@ class LlamaState: ObservableObject {
             nCtx: PhoneCacheBlendConfig.nCtxWikiMQA,
             elapsedSec: elapsed
         ) + "\n"
-        if path == .phoneCacheBlend, let diskLine = chunkStore?.summaryLine() {
+        if path.usesChunkCache, let diskLine = chunkStore?.summaryLine() {
             messageLog += diskLine
             if PhoneCacheBlendConfig.enableRamHotStitch {
                 messageLog += " · \(chunkRamCache.summaryLine())"
@@ -2291,8 +2778,9 @@ class LlamaState: ObservableObject {
         }
 
         messageLog += String(
-            format: "\nWikiMQA %@ benchmark complete (%.1f min).\n",
-            arm == .baseline ? "baseline" : "PCB",
+            format: "\n%@ %@ benchmark complete (%.1f min).\n",
+            datasetLabel,
+            arm.rawValue,
             elapsed / 60
         )
         if let ctx = llamaContext {
@@ -2305,14 +2793,15 @@ class LlamaState: ObservableObject {
         queryCount: Int,
         path: RagInferencePath
     ) async -> WikiMQABenchmarkStats {
-        let arm: WikiMQABenchmarkArm = path == .standardLlama ? .baseline : .pcb
+        let arm = WikiMQABenchmarkArm(path: path)
         var stats = WikiMQABenchmarkStats(arm: arm)
         let phaseStart = DispatchTime.now().uptimeNanoseconds
         let nCtx = PhoneCacheBlendConfig.nCtxWikiMQA
 
         for index in 0..<queryCount {
-            // Long contiguous @8192 prefills can leave Metal in a bad state; reload between queries.
             if index > 0 {
+                await wikiBenchmarkCooldownBetweenQueries()
+                await pauseForThermalIfNeeded()
                 do {
                     try await reloadLlamaContextAtNCtx(nCtx)
                 } catch {
@@ -2320,11 +2809,13 @@ class LlamaState: ObservableObject {
                     stats.recordFailure()
                     continue
                 }
+            } else {
+                await pauseForThermalIfNeeded()
             }
 
             guard llamaContext != nil else {
                 stats.recordFailure()
-                messageLog += String(format: "Q%03d  %@ FAILED (no context)\n", index + 1, arm == .baseline ? "baseline" : "pcb")
+                messageLog += String(format: "Q%03d  %@ FAILED (no context)\n", index + 1, path.shortTag)
                 continue
             }
 
@@ -2332,36 +2823,20 @@ class LlamaState: ObservableObject {
             let passages = WikiMQADataset.passages(from: example)
             let question = WikiMQADataset.normalizeQuestion(example.question)
             let gold = WikiMQADataset.goldAnswers(from: example)
-            let pathLabel = arm == .baseline ? "WikiMQA Q\(index + 1) baseline" : "WikiMQA Q\(index + 1) PCB"
+            let pathLabel = "WikiMQA Q\(index + 1) \(path.shortTag)"
+            let armLabel = path.shortTag
 
-            var result = await runSingleRagQuery(
+            guard let result = await runBenchmarkRagQueryWithRetries(
                 passages: passages,
                 question: question,
-                label: pathLabel,
+                pathLabel: pathLabel,
                 path: path,
-                logToMessage: false
-            )
-
-            if result == nil {
-                messageLog += String(format: "Q%03d  %@ failed — reloading GPU and retrying once…\n", index + 1, arm == .baseline ? "baseline" : "pcb")
-                do {
-                    try await reloadLlamaContextAtNCtx(nCtx)
-                    await llamaContext?.setMaxGenTokens(32)
-                    result = await runSingleRagQuery(
-                        passages: passages,
-                        question: question,
-                        label: pathLabel + " (retry)",
-                        path: path,
-                        logToMessage: false
-                    )
-                } catch {
-                    messageLog += "GPU reload on retry failed: \(error.localizedDescription)\n"
-                }
-            }
-
-            guard let result else {
+                nCtx: nCtx,
+                queryIndex: index,
+                armLabel: armLabel
+            ) else {
                 stats.recordFailure()
-                messageLog += String(format: "Q%03d  %@ FAILED\n", index + 1, arm == .baseline ? "baseline" : "pcb")
+                messageLog += String(format: "Q%03d  %@ FAILED (%d attempts)\n", index + 1, armLabel, PhoneCacheBlendConfig.wikiBenchmarkMaxRetries)
                 continue
             }
 
@@ -2389,6 +2864,511 @@ class LlamaState: ObservableObject {
         }
 
         return stats
+    }
+
+    /// MuSiQue benchmark for one path: baseline full prefill or PhoneCacheBlend (disk 1280, RAM 64).
+    func runMusiqueBenchmark(maxQueries: Int, path: RagInferencePath) async {
+        isInferring = true
+        guard loadedModelPath != nil else {
+            messageLog += "Load a model first (Models → Qwen).\n"
+            isInferring = false
+            return
+        }
+
+        let priorRamCap = chunkRamCache.stats().maxEntries
+        if path.usesChunkCache {
+            ChunkCacheConfig.setStressDiskMaxEntries(PhoneCacheBlendConfig.musiqueChunkDiskMaxEntries)
+            chunkRamCache.setMaxEntries(PhoneCacheBlendConfig.musiqueChunkRamMaxEntries)
+        }
+
+        defer {
+            if path.usesChunkCache {
+                ChunkCacheConfig.setStressDiskMaxEntries(nil)
+                chunkRamCache.setMaxEntries(priorRamCap)
+            }
+            isInferring = false
+        }
+
+        let examples: [MusiqueExample]
+        do {
+            examples = try MusiqueDataset.load()
+        } catch {
+            messageLog += "MuSiQue dataset load failed: \(error.localizedDescription)\n"
+            return
+        }
+
+        let queryCount = min(max(1, maxQueries), examples.count)
+        let arm = MusiqueBenchmarkArm(path: path)
+        let prompts = MusiqueDataset.benchmarkPrompts
+        let nCtx = PhoneCacheBlendConfig.nCtxMusique
+
+        do {
+            try await ensureContextCapacity(nCtx: nCtx)
+        } catch {
+            messageLog += "Failed to resize context: \(error.localizedDescription)\n"
+            return
+        }
+
+        messageLog += "Fresh GPU context for MuSiQue @8192 (Metal stability)…\n"
+        do {
+            try await reloadLlamaContextAtNCtx(nCtx)
+        } catch {
+            messageLog += "GPU context reload failed: \(error.localizedDescription)\n"
+            return
+        }
+
+        await llamaContext?.setMaxGenTokens(32)
+
+        let overallStart = DispatchTime.now().uptimeNanoseconds
+
+        messageLog += "\n========================================\n"
+        messageLog += "  MuSiQue \(arm.rawValue)\n"
+        messageLog += "  n_ctx=\(nCtx)\n"
+        messageLog += "  Prompts: CacheBlend blend_musique.py\n"
+        if path.usesChunkCache {
+            messageLog += "  Cache: disk \(PhoneCacheBlendConfig.musiqueChunkDiskMaxEntries), RAM hot \(PhoneCacheBlendConfig.musiqueChunkRamMaxEntries)\n"
+            messageLog += "  Precompute: system prefix + labels [1]…[10] before queries\n"
+        }
+        messageLog += "  Queries: \(queryCount)/\(examples.count)\n"
+        messageLog += "  Corpus: ~1,255 unique passages, 10 per query\n"
+        messageLog += "  Thermal: \(Self.thermalStateLabel())"
+        if Self.isThermalStressed() {
+            messageLog += " — waiting for cooldown (plug in, remove case)…\n"
+            await pauseForThermalIfNeeded()
+        } else {
+            messageLog += "\n"
+        }
+        messageLog += "========================================\n\n"
+
+        if path.usesChunkCache, let llamaContext {
+            _ = await prewarmPcbBenchmarkCaches(
+                llamaContext: llamaContext,
+                prompts: prompts,
+                labelCount: 10
+            )
+        }
+
+        let stats = await runMusiqueBenchmarkPhase(
+            examples: examples,
+            queryCount: queryCount,
+            path: path,
+            prompts: prompts
+        )
+
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - overallStart) / 1_000_000_000
+        messageLog += "\n" + stats.formattedSummary(
+            maxQueries: queryCount,
+            diskCap: PhoneCacheBlendConfig.musiqueChunkDiskMaxEntries,
+            ramCap: PhoneCacheBlendConfig.musiqueChunkRamMaxEntries,
+            nCtx: nCtx,
+            elapsedSec: elapsed
+        ) + "\n"
+        if path.usesChunkCache, let diskLine = chunkStore?.summaryLine() {
+            messageLog += diskLine
+            if PhoneCacheBlendConfig.enableRamHotStitch {
+                messageLog += " · \(chunkRamCache.summaryLine())"
+            }
+            messageLog += "\n"
+        }
+
+        messageLog += String(
+            format: "\nMuSiQue %@ benchmark complete (%.1f min).\n",
+            arm.rawValue,
+            elapsed / 60
+        )
+        if let ctx = llamaContext {
+            await ctx.setMaxGenTokens(128)
+        }
+    }
+
+    private func runMusiqueBenchmarkPhase(
+        examples: [MusiqueExample],
+        queryCount: Int,
+        path: RagInferencePath,
+        prompts: RagBenchmarkPrompts
+    ) async -> MusiqueBenchmarkStats {
+        let arm = MusiqueBenchmarkArm(path: path)
+        var stats = MusiqueBenchmarkStats(arm: arm)
+        let phaseStart = DispatchTime.now().uptimeNanoseconds
+        let nCtx = PhoneCacheBlendConfig.nCtxMusique
+
+        for index in 0..<queryCount {
+            if index > 0 {
+                await wikiBenchmarkCooldownBetweenQueries()
+                await pauseForThermalIfNeeded()
+                do {
+                    try await reloadLlamaContextAtNCtx(nCtx)
+                } catch {
+                    messageLog += "GPU reload failed before Q\(index + 1): \(error.localizedDescription)\n"
+                    stats.recordFailure()
+                    continue
+                }
+            } else {
+                await pauseForThermalIfNeeded()
+            }
+
+            guard llamaContext != nil else {
+                stats.recordFailure()
+                messageLog += String(format: "Q%03d  %@ FAILED (no context)\n", index + 1, path.shortTag)
+                continue
+            }
+
+            let example = examples[index]
+            let passages = MusiqueDataset.passages(from: example)
+            let question = MusiqueDataset.normalizeQuestion(example.question)
+            let gold = MusiqueDataset.goldAnswers(from: example)
+            let pathLabel = "MuSiQue Q\(index + 1) \(path.shortTag)"
+            let armLabel = path.shortTag
+
+            guard let result = await runBenchmarkRagQueryWithRetries(
+                passages: passages,
+                question: question,
+                pathLabel: pathLabel,
+                path: path,
+                nCtx: nCtx,
+                queryIndex: index,
+                armLabel: armLabel,
+                prompts: prompts
+            ) else {
+                stats.recordFailure()
+                messageLog += String(format: "Q%03d  %@ FAILED (%d attempts)\n", index + 1, armLabel, PhoneCacheBlendConfig.wikiBenchmarkMaxRetries)
+                continue
+            }
+
+            let f1 = MusiqueScorer.bestF1(prediction: result.answer, goldAnswers: gold)
+            stats.add(result: result, f1: f1)
+
+            let preview = String(result.answer.prefix(48))
+                .replacingOccurrences(of: "\n", with: " ")
+            messageLog += stats.formattedQueryLine(
+                index: index,
+                result: result,
+                f1: f1,
+                answerPreview: preview
+            ) + "\n"
+
+            if (index + 1) % 10 == 0 && index + 1 < queryCount {
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - phaseStart) / 1_000_000_000
+                messageLog += String(
+                    format: "  … checkpoint %d/%d (%.1f min in this phase)\n",
+                    index + 1,
+                    queryCount,
+                    elapsed / 60
+                )
+            }
+        }
+
+        return stats
+    }
+
+    /// Pinpoints WikiMQA baseline prefill failures: token budget, decode stage, reload vs sequential, retries.
+    func runWikiMQABaselineDiagnostics(
+        dataset: WikiMQADatasetVariant = .clean,
+        queryCount: Int = 10
+    ) async {
+        isInferring = true
+        guard loadedModelPath != nil, llamaContext != nil else {
+            messageLog += "Load a model first (Models → Qwen).\n"
+            isInferring = false
+            return
+        }
+
+        defer { isInferring = false }
+
+        let examples: [WikiMQAExample]
+        do {
+            examples = try WikiMQADataset.load(variant: dataset)
+        } catch {
+            messageLog += "\(dataset.logLabel) load failed: \(error.localizedDescription)\n"
+            return
+        }
+
+        let nQueries = min(max(1, queryCount), examples.count)
+        let nCtx = PhoneCacheBlendConfig.nCtxWikiMQA
+
+        do {
+            try await ensureContextCapacity(nCtx: nCtx)
+            try await reloadLlamaContextAtNCtx(nCtx)
+        } catch {
+            messageLog += "Context setup failed: \(error.localizedDescription)\n"
+            return
+        }
+
+        guard let ctx = llamaContext else { return }
+
+        await ctx.setMaxGenTokens(32)
+        clearChunkCache()
+
+        let mem = ramKvBlobStats()
+        let thermal = Self.thermalStateLabel()
+        let nBatch = await ctx.nBatch()
+        let liveCtx = await ctx.liveNCtx()
+
+        messageLog += "\n========================================\n"
+        messageLog += "  WikiMQA Baseline Diagnostics\n"
+        messageLog += "  Dataset: \(dataset.logLabel) (first \(nQueries) queries)\n"
+        messageLog += "  n_ctx=\(liveCtx)  n_batch=\(nBatch)  max_gen=32\n"
+        messageLog += "  thermal=\(thermal)"
+        if mem.residentBytes != nil || mem.availableBytes != nil {
+            messageLog += String(
+                format: "  RSS=%@  avail=%@",
+                mem.residentBytes.map { RamStressFormat.bytes($0) } ?? "n/a",
+                mem.availableBytes.map { RamStressFormat.bytes($0) } ?? "n/a"
+            )
+        }
+        messageLog += "\n========================================\n"
+
+        struct QueryProbe {
+            let index: Int
+            let prompt: String
+            let questionPreview: String
+            let passageChars: Int
+            let tokenCount: Int
+            let headroom: Int
+        }
+
+        var probes: [QueryProbe] = []
+        messageLog += "\n--- Phase 1: token scan (no GPU decode) ---\n"
+        for index in 0..<nQueries {
+            let example = examples[index]
+            let passages = WikiMQADataset.passages(from: example)
+            let question = WikiMQADataset.normalizeQuestion(example.question)
+            let prompt = Self.buildRagPrompt(passages: passages, question: question)
+            let tok = await ctx.countPromptTokens(text: prompt)
+            let headroom = Int(liveCtx) - tok - 32
+            let chars = passages.reduce(0) { $0 + $1.count }
+            let qPreview = String(question.prefix(56)).replacingOccurrences(of: "\n", with: " ")
+            probes.append(QueryProbe(
+                index: index,
+                prompt: prompt,
+                questionPreview: qPreview,
+                passageChars: chars,
+                tokenCount: tok,
+                headroom: headroom
+            ))
+            messageLog += String(
+                format: "Q%03d  tok=%4d  headroom=%4d  chars=%5d  |  %@\n",
+                index + 1,
+                tok,
+                headroom,
+                chars,
+                qPreview
+            )
+        }
+
+        if let minTok = probes.map(\.tokenCount).min(),
+           let maxTok = probes.map(\.tokenCount).max() {
+            messageLog += String(format: "Range: %d–%d tokens\n", minTok, maxTok)
+        }
+        let overBudget = probes.filter { $0.headroom < 0 }
+        if overBudget.isEmpty {
+            messageLog += "All queries fit in n_ctx with max_gen=32.\n"
+        } else {
+            messageLog += "OVER BUDGET: \(overBudget.map { "Q\($0.index + 1)" }.joined(separator: ", "))\n"
+        }
+
+        messageLog += "\n--- Phase 2: baseline prefill (GPU reload before each, like benchmark) ---\n"
+        var reloadOk = 0
+        var reloadStages: [String: Int] = [:]
+        for probe in probes {
+            do {
+                try await reloadLlamaContextAtNCtx(nCtx)
+            } catch {
+                messageLog += String(format: "Q%03d  GPU reload failed: %@\n", probe.index + 1, error.localizedDescription)
+                continue
+            }
+            guard let ctx = llamaContext else { continue }
+            await ctx.setMaxGenTokens(32)
+            let diag = await ctx.diagnoseBaselinePrefill(text: probe.prompt)
+            if diag.stage == .ok { reloadOk += 1 }
+            reloadStages[diag.stage.rawValue, default: 0] += 1
+            messageLog += String(format: "Q%03d  %@\n", probe.index + 1, diag.logLine)
+            await ctx.clear()
+        }
+        messageLog += String(format: "Reload-between: %d/%d OK", reloadOk, nQueries)
+        if !reloadStages.isEmpty {
+            let breakdown = reloadStages.sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: "  ")
+            messageLog += "  (\(breakdown))\n"
+        }
+
+        messageLog += "\n--- Phase 3: baseline prefill (no reload, sequential) ---\n"
+        do {
+            try await reloadLlamaContextAtNCtx(nCtx)
+        } catch {
+            messageLog += "GPU reload failed: \(error.localizedDescription)\n"
+        }
+        var seqOk = 0
+        for probe in probes {
+            guard let ctx = llamaContext else { break }
+            await ctx.setMaxGenTokens(32)
+            let diag = await ctx.diagnoseBaselinePrefill(text: probe.prompt)
+            if diag.stage == .ok { seqOk += 1 }
+            messageLog += String(format: "Q%03d  %@\n", probe.index + 1, diag.logLine)
+            await ctx.clear()
+        }
+        messageLog += String(format: "Sequential: %d/%d OK\n", seqOk, nQueries)
+
+        messageLog += "\n--- Phase 4: triple retry on Q1–Q3 (reload each attempt) ---\n"
+        for probe in probes.prefix(3) {
+            var outcomes: [String] = []
+            for attempt in 1...3 {
+                do {
+                    try await reloadLlamaContextAtNCtx(nCtx)
+                } catch {
+                    outcomes.append("r\(attempt):reload_fail")
+                    continue
+                }
+                guard let ctx = llamaContext else {
+                    outcomes.append("r\(attempt):no_ctx")
+                    continue
+                }
+                await ctx.setMaxGenTokens(32)
+                let diag = await ctx.diagnoseBaselinePrefill(text: probe.prompt)
+                outcomes.append("r\(attempt):\(diag.stage.rawValue)")
+                await ctx.clear()
+            }
+            messageLog += String(format: "Q%03d  %@\n", probe.index + 1, outcomes.joined(separator: "  "))
+        }
+
+        messageLog += "\n--- Phase 5: short warmup then Q1 full prefill ---\n"
+        if let first = probes.first {
+            do {
+                try await reloadLlamaContextAtNCtx(nCtx)
+            } catch {
+                messageLog += "GPU reload failed: \(error.localizedDescription)\n"
+            }
+            if let ctx = llamaContext {
+                let warmup = PhoneCacheBlendConfig.systemPrefix
+                let warmupDiag = await ctx.diagnoseBaselinePrefill(text: warmup + "\n\nAnswer:")
+                messageLog += "Warmup (~\(warmupDiag.promptTokens) tok): \(warmupDiag.stage.rawValue)\n"
+                await ctx.clear()
+                await ctx.setMaxGenTokens(32)
+                let fullDiag = await ctx.diagnoseBaselinePrefill(text: first.prompt)
+                messageLog += "Q001 after warmup: \(fullDiag.logLine)\n"
+                await ctx.clear()
+            }
+        }
+
+        messageLog += "\n--- Interpretation ---\n"
+        messageLog += "• prompt_too_long → reduce passages or raise n_ctx\n"
+        messageLog += "• llama_decode_failed → Metal/GPU error mid-prefill (often thermal or memory pressure)\n"
+        messageLog += "• logits_missing → prefill finished but no sampling logits (KV/Metal bug)\n"
+        messageLog += "• Reload-between OK but sequential worse → GPU state needs reload between long prefills\n"
+        messageLog += "• Triple retry mixed OK/FAIL → intermittent Metal instability (check thermal)\n"
+        messageLog += "• thermal=serious/critical → let phone cool; plug in; remove case before wiki benchmarks\n"
+        messageLog += "\nDiagnostics complete. Copy log to share.\n"
+
+        try? await ensureContextCapacity(nCtx: PhoneCacheBlendConfig.nCtxDefault)
+        if let ctx = llamaContext {
+            await ctx.setMaxGenTokens(128)
+        }
+    }
+
+    private static func isThermalStressed() -> Bool {
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious, .critical: return true
+        default: return false
+        }
+    }
+
+    /// Wait until thermal drops below serious, or until max wait (then continue with warning).
+    private func pauseForThermalIfNeeded(
+        maxWaitSeconds: UInt64 = PhoneCacheBlendConfig.wikiBenchmarkThermalPauseMaxSec
+    ) async {
+        let pollNs: UInt64 = 10_000_000_000
+        let deadline = DispatchTime.now().uptimeNanoseconds + maxWaitSeconds * 1_000_000_000
+        while Self.isThermalStressed() {
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                messageLog += String(
+                    format: "Thermal still %@ after %ds — continuing (decode failures likely).\n",
+                    Self.thermalStateLabel(),
+                    maxWaitSeconds
+                )
+                return
+            }
+            messageLog += String(format: "Thermal %@ — cooling 10s…\n", Self.thermalStateLabel())
+            try? await Task.sleep(nanoseconds: pollNs)
+        }
+    }
+
+    private func wikiBenchmarkCooldownBetweenQueries() async {
+        let seconds: UInt64
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:
+            seconds = PhoneCacheBlendConfig.wikiBenchmarkInterQueryCooldownNominalSec
+        case .fair:
+            seconds = PhoneCacheBlendConfig.wikiBenchmarkInterQueryCooldownFairSec
+        case .serious, .critical:
+            seconds = PhoneCacheBlendConfig.wikiBenchmarkInterQueryCooldownSeriousSec
+        @unknown default:
+            seconds = PhoneCacheBlendConfig.wikiBenchmarkInterQueryCooldownFairSec
+        }
+        if seconds > 0 {
+            messageLog += String(
+                format: "Inter-query cooldown %ds (thermal=%@)…\n",
+                seconds,
+                Self.thermalStateLabel()
+            )
+            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+        }
+    }
+
+    private func runBenchmarkRagQueryWithRetries(
+        passages: [String],
+        question: String,
+        pathLabel: String,
+        path: RagInferencePath,
+        nCtx: UInt32,
+        queryIndex: Int,
+        armLabel: String,
+        prompts: RagBenchmarkPrompts = .standard
+    ) async -> RagQueryResult? {
+        let maxAttempts = PhoneCacheBlendConfig.wikiBenchmarkMaxRetries
+        for attempt in 1...maxAttempts {
+            if attempt > 1 {
+                messageLog += String(
+                    format: "Q%03d  %@ attempt %d/%d — cooldown + GPU reload…\n",
+                    queryIndex + 1,
+                    armLabel,
+                    attempt,
+                    maxAttempts
+                )
+                await wikiBenchmarkCooldownBetweenQueries()
+                await pauseForThermalIfNeeded(maxWaitSeconds: 60)
+                do {
+                    try await reloadLlamaContextAtNCtx(nCtx)
+                    await llamaContext?.setMaxGenTokens(32)
+                } catch {
+                    messageLog += "GPU reload on retry failed: \(error.localizedDescription)\n"
+                    continue
+                }
+            }
+
+            let label = attempt == 1 ? pathLabel : "\(pathLabel) (retry \(attempt))"
+            if let result = await runSingleRagQuery(
+                passages: passages,
+                question: question,
+                label: label,
+                path: path,
+                logToMessage: false,
+                prompts: prompts
+            ) {
+                return result
+            }
+        }
+        return nil
+    }
+
+    private static func thermalStateLabel() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
     }
 
     /// Minimal WikiMQA PCB debug: cache only 10 passages in RAM, then 4/8/10-passage probes.
@@ -2569,8 +3549,9 @@ class LlamaState: ObservableObject {
             }
 
             let stepStart = DispatchTime.now().uptimeNanoseconds
+            var discardTiming = EnsureTimingBreakdown()
             if priorCount == 0 {
-                _ = await ensureSystemPrefixCached(llamaContext: llamaContext)
+                _ = await ensureSystemPrefixCached(llamaContext: llamaContext, timing: &discardTiming)
             }
             let newPassages = Array(cumulativePassages[priorCount..<target])
             messageLog += String(
@@ -2585,7 +3566,8 @@ class LlamaState: ObservableObject {
                 let oneStart = DispatchTime.now().uptimeNanoseconds
                 let batch = await ensurePassagesCached(
                     passages: [passage],
-                    llamaContext: llamaContext
+                    llamaContext: llamaContext,
+                    timing: &discardTiming
                 )
                 let oneMs = Double(DispatchTime.now().uptimeNanoseconds - oneStart) / 1_000_000
                 if let result = batch.first {
@@ -2613,7 +3595,11 @@ class LlamaState: ObservableObject {
             }
             if PhoneCacheBlendConfig.enableLabelKvCache {
                 for idx in priorCount..<target {
-                    _ = await ensureLabelKvCached(listIndex: idx, llamaContext: llamaContext)
+                    _ = await ensureLabelKvCached(
+                        listIndex: idx,
+                        llamaContext: llamaContext,
+                        timing: &discardTiming
+                    )
                 }
             }
             let stepMs = Double(DispatchTime.now().uptimeNanoseconds - stepStart) / 1_000_000

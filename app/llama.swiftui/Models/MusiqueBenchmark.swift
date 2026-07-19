@@ -1,65 +1,13 @@
 import Foundation
 
-/// Word-level F1 (SQuAD-style normalization). Server WikiMQA uses tokenizer token F1;
-/// this is comparable for short answers but not identical across tokenizers.
-enum WikiMQAScorer {
-    static func parseGeneration(_ s: String) -> String {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        let firstLine = trimmed.components(separatedBy: "\n").first ?? trimmed
-        let words = firstLine.split(separator: " ", omittingEmptySubsequences: true)
-        guard let head = words.first else { return firstLine }
-        let headLower = head.lowercased()
-        if headLower.hasPrefix("yes") { return "Yes" }
-        if headLower.hasPrefix("no") { return "No" }
-        return firstLine
-    }
-
-    static func normalizeAnswer(_ s: String) -> [String] {
-        let lowered = s.lowercased()
-        let noArticles = lowered.replacingOccurrences(
-            of: #"\b(a|an|the)\b"#,
-            with: " ",
-            options: .regularExpression
-        )
-        let noPunc = noArticles.unicodeScalars.filter { !CharacterSet.punctuationCharacters.contains($0) }
-            .map { Character($0) }
-        let collapsed = String(noPunc).split(separator: " ", omittingEmptySubsequences: true)
-        return collapsed.map(String.init)
-    }
-
-    static func tokenF1(prediction: [String], gold: [String]) -> Double {
-        if gold.isEmpty || prediction.isEmpty {
-            return gold == prediction ? 1.0 : 0.0
-        }
-        var goldCounts: [String: Int] = [:]
-        for tok in gold { goldCounts[tok, default: 0] += 1 }
-        var predCounts: [String: Int] = [:]
-        for tok in prediction { predCounts[tok, default: 0] += 1 }
-        var overlap = 0
-        for (tok, predN) in predCounts {
-            if let goldN = goldCounts[tok] {
-                overlap += min(predN, goldN)
-            }
-        }
-        if overlap == 0 { return 0 }
-        let precision = Double(overlap) / Double(prediction.count)
-        let recall = Double(overlap) / Double(gold.count)
-        return 2 * precision * recall / (precision + recall)
-    }
-
+/// Word-level F1 (same scorer as WikiMQA; server MuSiQue uses tokenizer token F1).
+enum MusiqueScorer {
     static func bestF1(prediction: String, goldAnswers: [String]) -> Double {
-        let pred = parseGeneration(prediction)
-        let predTokens = normalizeAnswer(pred)
-        var best = 0.0
-        for gold in goldAnswers {
-            let goldTokens = normalizeAnswer(gold)
-            best = max(best, tokenF1(prediction: predTokens, gold: goldTokens))
-        }
-        return best
+        WikiMQAScorer.bestF1(prediction: prediction, goldAnswers: goldAnswers)
     }
 }
 
-enum WikiMQABenchmarkArm: String {
+enum MusiqueBenchmarkArm: String {
     case baseline = "Baseline (full prefill)"
     case pcb = "PhoneCacheBlend"
     case pcbNoFuse = "PhoneCacheBlend no-fuse (ratio=0)"
@@ -77,8 +25,8 @@ enum WikiMQABenchmarkArm: String {
     }
 }
 
-struct WikiMQABenchmarkStats {
-    let arm: WikiMQABenchmarkArm
+struct MusiqueBenchmarkStats {
+    let arm: MusiqueBenchmarkArm
 
     var queriesRun = 0
     var queriesFailed = 0
@@ -91,17 +39,14 @@ struct WikiMQABenchmarkStats {
     var totalF1 = 0.0
     var fallbacks = 0
 
-    /// Ensure phase: prefix + passages + labels (disk cache HIT vs SAVE).
     var ensureHits = 0
     var ensureSaves = 0
-    /// Passage bodies only (10 per query).
     var passageEnsureHits = 0
     var passageEnsureSaves = 0
-    /// Stitch phase: RAM-hot vs disk reload.
     var stitchRamHits = 0
     var stitchDiskLoads = 0
 
-    init(arm: WikiMQABenchmarkArm) {
+    init(arm: MusiqueBenchmarkArm) {
         self.arm = arm
     }
 
@@ -164,7 +109,7 @@ struct WikiMQABenchmarkStats {
         elapsedSec: Double
     ) -> String {
         var lines: [String] = []
-        lines.append("--- WikiMQA \(arm.rawValue) summary ---")
+        lines.append("--- MuSiQue \(arm.rawValue) summary ---")
         lines.append("Queries: \(queriesRun)/\(maxQueries) ok, \(queriesFailed) failed")
         if arm.usesChunkCache {
             lines.append("PCB fallbacks: \(fallbacks)")
@@ -268,31 +213,5 @@ struct WikiMQABenchmarkStats {
                 answerPreview
             )
         }
-    }
-
-    static func formattedComparison(
-        baseline: WikiMQABenchmarkStats,
-        pcb: WikiMQABenchmarkStats,
-        queryCount: Int
-    ) -> String {
-        guard baseline.queriesRun > 0, pcb.queriesRun > 0 else {
-            return "--- WikiMQA baseline vs PCB ---\n(insufficient results for comparison)\n"
-        }
-        let speedup = baseline.meanE2eMs() / pcb.meanE2eMs()
-        var lines: [String] = []
-        lines.append("--- WikiMQA baseline vs PCB (\(queryCount) queries) ---")
-        lines.append(String(
-            format: "E2E TTFT mean:  baseline %.0f ms  |  PCB %.0f ms  |  speedup %.2fx",
-            baseline.meanE2eMs(),
-            pcb.meanE2eMs(),
-            speedup
-        ))
-        lines.append(String(
-            format: "Word F1 mean:   baseline %.3f  |  PCB %.3f",
-            baseline.meanF1(),
-            pcb.meanF1()
-        ))
-        lines.append("(Speedup = baseline E2E ÷ PCB E2E; both include full prompt + first token.)")
-        return lines.joined(separator: "\n")
     }
 }

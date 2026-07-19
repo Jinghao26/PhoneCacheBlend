@@ -111,6 +111,50 @@ enum LlamaError: Error, LocalizedError {
     }
 }
 
+/// Result of a single baseline full-prefill probe (for on-device diagnostics).
+struct BaselinePrefillDiagnostic: Sendable {
+    enum Stage: String, Sendable {
+        case ok
+        case promptTooLong = "prompt_too_long"
+        case decodeFailed = "llama_decode_failed"
+        case logitsMissing = "logits_missing"
+        case sampleFailed = "sample_failed"
+    }
+
+    let promptTokens: Int
+    let nCtx: Int
+    let maxGen: Int
+    let kvRequired: Int
+    let headroom: Int
+    let stage: Stage
+    let prefillMs: Double?
+    let firstToken: String?
+
+    var logLine: String {
+        if stage == .ok {
+            let tok = firstToken?
+                .replacingOccurrences(of: "\n", with: " ")
+                .prefix(24) ?? ""
+            return String(
+                format: "OK  tok=%d headroom=%d prefill=%.0fms first='%@'",
+                promptTokens,
+                headroom,
+                prefillMs ?? 0,
+                String(tok)
+            )
+        }
+        return String(
+            format: "FAIL %-18@ tok=%d kv=%d n_ctx=%d headroom=%d prefill=%.0fms",
+            stage.rawValue,
+            promptTokens,
+            kvRequired,
+            nCtx,
+            headroom,
+            prefillMs ?? 0
+        )
+    }
+}
+
 /// One layer's V cache exported as float32 `[n_tokens][n_kv_heads][head_dim]`.
 struct LayerVExport: Sendable {
     let values: [Float]
@@ -128,6 +172,7 @@ struct CacheBlendFuseResult: Sendable {
     let recompRatio: Float
     let indices: [UInt32]
     let fuseMs: Double
+    let timing: FuseTimingBreakdown
 
     var topkPrefixCount: UInt32 {
         guard indices.count >= suffixLen else { return 0 }
@@ -137,23 +182,109 @@ struct CacheBlendFuseResult: Sendable {
     var summary: String {
         let idxPreview = indices.prefix(16).map(String.init).joined(separator: ", ")
         let more = indices.count > 16 ? ", …" : ""
-        return String(
-            format: """
-            --- CacheBlend fuse (%@, layer %d) ---
-            Tokens: %u (suffix %u, top-K prefix %u @ ratio %.2f)
-            Fuse time: %.1f ms
-            |imp| = %u: [%@%@]
-            """,
-            mode.label,
-            checkLayer,
-            nTokens,
-            suffixLen,
-            topkPrefixCount,
-            recompRatio,
-            fuseMs,
-            indices.count,
-            idxPreview,
-            more
+        var lines = [
+            String(
+                format: """
+                --- CacheBlend fuse (%@, layer %d) ---
+                Tokens: %u (suffix %u, top-K prefix %u @ ratio %.2f)
+                Fuse time: %.1f ms
+                |imp| = %u: [%@%@]
+                """,
+                mode.label,
+                checkLayer,
+                nTokens,
+                suffixLen,
+                topkPrefixCount,
+                recompRatio,
+                fuseMs,
+                indices.count,
+                idxPreview,
+                more
+            ),
+        ]
+        lines.append(timing.formattedLog(fuseTotalMs: fuseMs))
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// Per-component fuse wall times (ms) from `llama_cache_blend_timing` + Swift post-fuse.
+struct FuseTimingBreakdown: Sendable {
+    var indicesMs: Double = 0
+    var attentionMs: Double = 0
+    var fullMs: Double = 0
+    var checkAMs: Double = 0
+    var checkCMs: Double = 0
+    var subsetMs: Double = 0
+    /// Wall time inside `llama_cache_blend_fuse` only (C++ multipass).
+    var cppMs: Double = 0
+    /// Swift `llama_synchronize` after C++ returns (drains leftover Metal work, mostly SUBSET).
+    var syncMs: Double = 0
+    /// Optional `primeSamplingLogits` decode+sync when logits were missing.
+    var logitsPrimeMs: Double = 0
+    /// True if the logits-prime path actually ran a decode.
+    var logitsPrimed: Bool = false
+    /// True if logits were required but still missing after a prime attempt.
+    var logitsPrimeFailed: Bool = false
+
+    /// C++ multipass timers only (indices + attention). Does not include Metal drain.
+    var phaseMs: Double { indicesMs + attentionMs }
+    /// Named wall-time buckets that should sum to fuseMs (phases + post sync + logits).
+    var accountedMs: Double { phaseMs + syncMs + logitsPrimeMs }
+    var postCppMs: Double { syncMs + logitsPrimeMs }
+    var explainedMs: Double { accountedMs }
+
+    func formattedLog(fuseTotalMs: Double) -> String {
+        let unexplained = fuseTotalMs - accountedMs
+        var lines: [String] = []
+        lines.append("--- Fuse breakdown ---")
+        lines.append(String(format: "  Indices (HKVD): %.1f ms  (V export + HKVD select)", indicesMs))
+        lines.append(String(format: "  Attention:      %.1f ms  (FULL + CHECK + SUBSET enqueue)", attentionMs))
+        if fullMs > 0 || checkAMs > 0 || checkCMs > 0 || subsetMs > 0 {
+            lines.append(String(format: "    FULL:         %.1f ms  (layers [0..check-1])", fullMs))
+            lines.append(String(format: "    CHECK A:      %.1f ms  (QKV at check layer)", checkAMs))
+            lines.append(String(format: "    CHECK C:      %.1f ms  (subset attn)", checkCMs))
+            lines.append(String(
+                format: "    SUBSET:       %.1f ms  (upper layers; GPU often finishes in Post sync)",
+                subsetMs
+            ))
+        }
+        if cppMs > 0 {
+            lines.append(String(format: "  C++ fuse:       %.1f ms  (phases above; async submit)", cppMs))
+        }
+        lines.append(String(
+            format: "  Post sync:      %.1f ms  (Metal drain after C++ — leftover SUBSET GPU)",
+            syncMs
+        ))
+        if logitsPrimeMs > 0 || logitsPrimed || logitsPrimeFailed {
+            lines.append(String(
+                format: "  Logits prime:   %.1f ms  (%@)",
+                logitsPrimeMs,
+                logitsPrimeFailed
+                    ? "FAILED — logits still missing"
+                    : (logitsPrimed ? "extra decode ran" : "skipped / logits already ready")
+            ))
+        }
+        lines.append("  ─────────────────────────")
+        lines.append(String(
+            format: "  Sum accounted:   %.1f ms  (phases + post sync + logits; unexplained %+.1f ms vs fuse %.1f ms)",
+            accountedMs, unexplained, fuseTotalMs
+        ))
+        return lines.joined(separator: "\n")
+    }
+
+    /// One-line summary for integration / stitch-profile logs.
+    func integrationLine(fuseTotalMs: Double) -> String {
+        String(
+            format: "  fuse: indices %.1f  attn %.1f  post-sync %.1f  logits %.1f  (FULL %.1f  A %.1f  C %.1f  SUB %.1f / %.1f ms)",
+            indicesMs,
+            attentionMs,
+            syncMs,
+            logitsPrimeMs,
+            fullMs,
+            checkAMs,
+            checkCMs,
+            subsetMs,
+            fuseTotalMs
         )
     }
 }
@@ -474,6 +605,77 @@ actor LlamaContext {
         UInt32(llama_n_ctx(context))
     }
 
+    func nBatch() -> UInt32 {
+        llama_n_batch(context)
+    }
+
+    /// Token count for a full baseline RAG prompt (BOS + passages + question).
+    func countPromptTokens(text: String) -> Int {
+        tokenize(text: text, add_bos: true).count
+    }
+
+    /// Step-by-step baseline prefill probe; samples one token but does not run full decode.
+    func diagnoseBaselinePrefill(text: String) -> BaselinePrefillDiagnostic {
+        clear()
+
+        let tokens = tokenize(text: text, add_bos: true)
+        let nCtxVal = Int(llama_n_ctx(context))
+        let maxGen = Int(max_gen_tokens)
+        let kvRequired = tokens.count + maxGen
+        let headroom = nCtxVal - kvRequired
+
+        func make(
+            stage: BaselinePrefillDiagnostic.Stage,
+            prefillMs: Double? = nil,
+            firstToken: String? = nil
+        ) -> BaselinePrefillDiagnostic {
+            BaselinePrefillDiagnostic(
+                promptTokens: tokens.count,
+                nCtx: nCtxVal,
+                maxGen: maxGen,
+                kvRequired: kvRequired,
+                headroom: headroom,
+                stage: stage,
+                prefillMs: prefillMs,
+                firstToken: firstToken
+            )
+        }
+
+        if kvRequired > nCtxVal {
+            return make(stage: .promptTooLong)
+        }
+
+        is_done = false
+        n_decode = 0
+        first_token_recorded = false
+        tokens_list = tokens
+        temporary_invalid_cchars = []
+
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        if !decodePromptTokens(tokens, pos0: 0, logitsOnLast: true) {
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+            return make(stage: .decodeFailed, prefillMs: ms)
+        }
+        llama_synchronize(context)
+
+        let prefillMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+        if !samplingLogitsReady() {
+            return make(stage: .logitsMissing, prefillMs: prefillMs)
+        }
+
+        prefill_end_ns = DispatchTime.now().uptimeNanoseconds
+        n_cur = Int32(tokens.count)
+
+        let newTokenId = llama_sampler_sample(sampling, context, -1)
+        if llama_vocab_is_eog(vocab, newTokenId) {
+            return make(stage: .ok, prefillMs: prefillMs, firstToken: "")
+        }
+
+        let cchars = token_to_piece(token: newTokenId)
+        let piece = String(cString: cchars + [0])
+        return make(stage: .ok, prefillMs: prefillMs, firstToken: piece)
+    }
+
     func model_info() -> String {
         let result = UnsafeMutablePointer<Int8>.allocate(capacity: 256)
         result.initialize(repeating: Int8(0), count: 256)
@@ -525,6 +727,10 @@ actor LlamaContext {
                 print("llama_decode() failed during prompt chunk off=\(off) chunk=\(chunk)")
                 return false
             }
+            // Long wiki-scale prefills: sync between n_batch chunks to reduce Metal flake under thermal load.
+            if tokens.count > 2048 {
+                llama_synchronize(context)
+            }
             off += chunk
         }
         return true
@@ -540,6 +746,14 @@ actor LlamaContext {
         }
         let pos = n_cur - 1
         let token = tokens_list[Int(pos)]
+
+        // After stitch/fuse the slot at `pos` is already occupied. Re-decode without
+        // clearing it fails on Metal (and is the usual cause of "logits unavailable"
+        // when GRAPH fuse did not emit logits for the last token).
+        if let mem = llama_get_memory(context) {
+            _ = llama_memory_seq_rm(mem, 0, pos, -1)
+        }
+
         llama_batch_clear(&batch)
         llama_batch_add(&batch, token, pos, [0], true)
         if llama_decode(context, batch) != 0 {
@@ -895,52 +1109,76 @@ actor LlamaContext {
     }
 
     /// Prefill passage text, save KV to `binPath`, return timing stats.
-    func collectAndSaveChunk(prefillText: String, binPath: String) throws -> (nTokens: Int, prefillMs: Double, saveMs: Double) {
+    func collectAndSaveChunk(
+        prefillText: String,
+        binPath: String
+    ) throws -> (nTokens: Int, tokenizeMs: Double, prefillMs: Double, storeMs: Double) {
         let t0 = DispatchTime.now().uptimeNanoseconds
         let tokens = tokenizeChunk(prefillText)
+        let tTok = DispatchTime.now().uptimeNanoseconds
         _ = try prefillTokens(tokens)
         let t1 = DispatchTime.now().uptimeNanoseconds
 
-        let saveStart = DispatchTime.now().uptimeNanoseconds
         guard saveSequenceState(path: binPath, tokens: tokens, seqId: 0) else {
             throw LlamaError.chunkSaveFailed(path: binPath)
         }
         let t2 = DispatchTime.now().uptimeNanoseconds
 
-        let prefillMs = Double(t1 - t0) / 1_000_000.0
-        let saveMs = Double(t2 - saveStart) / 1_000_000.0
-        return (tokens.count, prefillMs, saveMs)
+        return (
+            tokens.count,
+            Double(tTok - t0) / 1_000_000.0,
+            Double(t1 - tTok) / 1_000_000.0,
+            Double(t2 - t1) / 1_000_000.0
+        )
     }
 
     /// Prefill BOS + system prefix, save KV to `binPath` (matches stitch tokenization).
-    func collectAndSavePrefix(prefixText: String, binPath: String) throws -> (nTokens: Int, prefillMs: Double, saveMs: Double) {
+    func collectAndSavePrefix(
+        prefixText: String,
+        binPath: String
+    ) throws -> (nTokens: Int, tokenizeMs: Double, prefillMs: Double, storeMs: Double) {
         let t0 = DispatchTime.now().uptimeNanoseconds
         let tokens = tokenize(text: prefixText, add_bos: true)
+        let tTok = DispatchTime.now().uptimeNanoseconds
         _ = try prefillTokens(tokens)
         let t1 = DispatchTime.now().uptimeNanoseconds
 
-        let saveStart = DispatchTime.now().uptimeNanoseconds
         guard saveSequenceState(path: binPath, tokens: tokens, seqId: 0) else {
             throw LlamaError.chunkSaveFailed(path: binPath)
         }
         let t2 = DispatchTime.now().uptimeNanoseconds
 
-        let prefillMs = Double(t1 - t0) / 1_000_000.0
-        let saveMs = Double(t2 - saveStart) / 1_000_000.0
-        return (tokens.count, prefillMs, saveMs)
+        return (
+            tokens.count,
+            Double(tTok - t0) / 1_000_000.0,
+            Double(t1 - tTok) / 1_000_000.0,
+            Double(t2 - t1) / 1_000_000.0
+        )
     }
 
     /// Prefill a list label (`"[n] "`) in isolation and capture KV for RAM cache.
-    func collectLabelKvSnapshot(labelText: String) throws -> (data: Data, nTokens: Int) {
+    func collectLabelKvSnapshot(
+        labelText: String
+    ) throws -> (data: Data, nTokens: Int, tokenizeMs: Double, prefillMs: Double, captureMs: Double) {
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let tokens = tokenize(text: labelText, add_bos: false)
+        let tTok = DispatchTime.now().uptimeNanoseconds
         guard !tokens.isEmpty else {
             throw LlamaError.chunkPrefillFailed(tokenCount: 0)
         }
         _ = try prefillTokens(tokens)
+        let t1 = DispatchTime.now().uptimeNanoseconds
         guard let data = captureSequenceState(seqId: 0) else {
             throw LlamaError.couldNotLoadCachedChunk
         }
-        return (data, tokens.count)
+        let t2 = DispatchTime.now().uptimeNanoseconds
+        return (
+            data,
+            tokens.count,
+            Double(tTok - t0) / 1_000_000.0,
+            Double(t1 - tTok) / 1_000_000.0,
+            Double(t2 - t1) / 1_000_000.0
+        )
     }
 
     /// Restore a cached KV blob (prefix or chunk body) into stream 0 at `position`.
@@ -1238,7 +1476,8 @@ actor LlamaContext {
         recompRatio: Float = 0.18,
         mode: CacheBlendFuseMode = .graph,
         impIndices: [UInt32]? = nil,
-        requireSamplingLogits: Bool = true
+        requireSamplingLogits: Bool = true,
+        throwOnMissingLogits: Bool = true
     ) throws -> CacheBlendFuseResult {
         let layer = checkLayer ?? defaultHkvdCheckLayer()
         tokens_list = tokens
@@ -1260,6 +1499,9 @@ actor LlamaContext {
         params.n_tokens = UInt32(tokens.count)
         params.seq_id = 0
 
+        var cTiming = llama_cache_blend_timing()
+        params.timing_out = nil
+
         var impOut = [UInt32](repeating: 0, count: tokens.count)
         var nImpOut: UInt32 = 0
 
@@ -1276,7 +1518,11 @@ actor LlamaContext {
                     params.n_imp = UInt32(imp.count)
                     params.imp_indices_out = nil
                     params.n_imp_out = nil
-                    return llama_cache_blend_fuse(context, &params)
+                    // timing_out already set; keep pointer valid across call
+                    return withUnsafeMutablePointer(to: &cTiming) { timingPtr in
+                        params.timing_out = timingPtr
+                        return llama_cache_blend_fuse(context, &params)
+                    }
                 }
             }
 
@@ -1287,10 +1533,14 @@ actor LlamaContext {
                 params.imp_indices_out_capacity = UInt32(outPtr.count)
                 return withUnsafeMutablePointer(to: &nImpOut) { nImpPtr in
                     params.n_imp_out = nImpPtr
-                    return llama_cache_blend_fuse(context, &params)
+                    return withUnsafeMutablePointer(to: &cTiming) { timingPtr in
+                        params.timing_out = timingPtr
+                        return llama_cache_blend_fuse(context, &params)
+                    }
                 }
             }
         }
+        let cppEndNs = DispatchTime.now().uptimeNanoseconds
         guard rc == 0 else {
             print("llama_cache_blend_fuse failed: rc=\(rc)")
             throw LlamaError.cacheBlendFuseFailed(rc)
@@ -1304,29 +1554,61 @@ actor LlamaContext {
         }
 
         n_cur = Int32(tokens.count)
-        llama_synchronize(context)
 
+        let syncStartNs = DispatchTime.now().uptimeNanoseconds
+        llama_synchronize(context)
+        let syncEndNs = DispatchTime.now().uptimeNanoseconds
+
+        var logitsPrimed = false
+        var logitsPrimeMs = 0.0
+        var logitsPrimeFailed = false
         if requireSamplingLogits {
             if !samplingLogitsReady() {
-                if !primeSamplingLogits() {
+                let primeStartNs = DispatchTime.now().uptimeNanoseconds
+                if primeSamplingLogits() {
+                    logitsPrimed = true
+                } else {
                     print("cache_blend_fuse: failed to prime sampling logits")
-                    throw LlamaError.samplingLogitsUnavailable
+                    logitsPrimeFailed = true
                 }
+                logitsPrimeMs = Double(DispatchTime.now().uptimeNanoseconds - primeStartNs) / 1_000_000.0
             }
         }
 
         let fuseMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000.0
         prefill_end_ns = DispatchTime.now().uptimeNanoseconds
 
-        return CacheBlendFuseResult(
+        let timing = FuseTimingBreakdown(
+            indicesMs: cTiming.indices_ms,
+            attentionMs: cTiming.attention_ms,
+            fullMs: cTiming.full_ms,
+            checkAMs: cTiming.check_a_ms,
+            checkCMs: cTiming.check_c_ms,
+            subsetMs: cTiming.subset_ms,
+            cppMs: Double(cppEndNs - t0) / 1_000_000.0,
+            syncMs: Double(syncEndNs - syncStartNs) / 1_000_000.0,
+            logitsPrimeMs: logitsPrimeMs,
+            logitsPrimed: logitsPrimed,
+            logitsPrimeFailed: logitsPrimeFailed
+        )
+
+        let result = CacheBlendFuseResult(
             mode: mode,
             checkLayer: layer,
             nTokens: UInt32(tokens.count),
             suffixLen: suffixLen,
             recompRatio: recompRatio,
             indices: indices,
-            fuseMs: fuseMs
+            fuseMs: fuseMs,
+            timing: timing
         )
+
+        // Sampling callers need logits; residual probes keep timings even when prime fails.
+        if throwOnMissingLogits && requireSamplingLogits && !samplingLogitsReady() {
+            throw LlamaError.samplingLogitsUnavailable
+        }
+
+        return result
     }
 
     // MARK: - Phase D: layer KV export + HKVD
